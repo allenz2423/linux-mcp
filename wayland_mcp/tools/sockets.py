@@ -161,10 +161,11 @@ def list_network_sockets(query: str = "", limit: int = 100) -> NetworkSocketList
                 _integer_field(fields[uid_index], maximum=4_294_967_295)
                 if uid_index is not None and uid_index < len(fields) else None
             )
-            inode = (
+            raw_inode = (
                 _integer_field(fields[inode_index])
                 if inode_index is not None and inode_index < len(fields) else None
             )
+            inode = raw_inode if raw_inode is not None and raw_inode > 0 else None
             item = NetworkSocketInfo(
                 protocol=protocol,
                 family=family,
@@ -227,7 +228,19 @@ def _clean_socket_path(value: str, maximum: int = 2048) -> str:
 
 
 def _column_indices(header: str) -> dict[str, int]:
-    return {name.casefold(): index for index, name in enumerate(header.split())}
+    columns: dict[str, int] = {}
+    collapsed_pairs = 0
+    # Procfs headers split queue/timer pairs that each occupy one row token.
+    for index, raw_name in enumerate(header.split()):
+        name = raw_name.casefold()
+        if name == "remote_address":
+            name = "rem_address"
+        if name in {"rx_queue", "tm->when"}:
+            columns[name] = index - collapsed_pairs - 1
+            collapsed_pairs += 1
+        else:
+            columns[name] = index - collapsed_pairs
+    return columns
 
 
 def list_unix_raw_sockets(query: str = "", limit: int = 100) -> UnixRawSocketResponse:
@@ -338,10 +351,11 @@ def list_unix_raw_sockets(query: str = "", limit: int = 100) -> UnixRawSocketRes
                 _integer_field(fields[uid_index], maximum=4_294_967_295)
                 if uid_index is not None and uid_index < len(fields) else None
             )
-            inode = (
+            raw_inode = (
                 _integer_field(fields[inode_index])
                 if inode_index is not None and inode_index < len(fields) else None
             )
+            inode = raw_inode if raw_inode is not None and raw_inode > 0 else None
             remote_unspecified = remote[0] in {"0.0.0.0", "::"}
             item = RawSocketInfo(
                 family=family,
@@ -369,7 +383,14 @@ def list_unix_raw_sockets(query: str = "", limit: int = 100) -> UnixRawSocketRes
         return UnixRawSocketResponse(success=False, limit=limit, truncated=truncated, message=f"Could not read UNIX/raw socket inventory: {detail}")
 
     unix_sockets.sort(key=lambda item: (item.path or "", item.socket_type, item.inode))
-    raw_sockets.sort(key=lambda item: (item.family, item.local_address, item.local_protocol_number, item.remote_address or "", item.remote_protocol_number or 0))
+    raw_sockets.sort(key=lambda item: (
+        item.family,
+        item.local_address,
+        item.local_protocol_number,
+        item.remote_address or "",
+        item.state,
+        item.inode or 0,
+    ))
     total_unix = len(unix_sockets)
     total_raw = len(raw_sockets)
     truncated = truncated or bool(errors) or malformed_rows > 0 or total_unix > limit or total_raw > limit
