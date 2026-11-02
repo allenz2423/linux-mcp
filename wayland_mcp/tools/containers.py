@@ -73,6 +73,8 @@ MAX_TOKENS = 8_192
 TOKEN_TTL_SECONDS = 300
 API_TIMEOUT_SECONDS = 5.0
 IMAGE_PULL_TIMEOUT_SECONDS = 30 * 60.0
+CONTAINER_STOP_GRACE_SECONDS = 10
+CONTAINER_ACTION_TIMEOUT_SECONDS = API_TIMEOUT_SECONDS + CONTAINER_STOP_GRACE_SECONDS + 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -2007,7 +2009,7 @@ def _action_path(action: str, container_id: str) -> tuple[str, str]:
     escaped_id = quote(container_id, safe="")
     if action == "remove":
         return "DELETE", f"/containers/{escaped_id}?force=false&v=false"
-    suffix = f"?t=10" if action in {"stop", "restart"} else ""
+    suffix = f"?t={CONTAINER_STOP_GRACE_SECONDS}" if action in {"stop", "restart"} else ""
     return "POST", f"/containers/{escaped_id}/{action}{suffix}"
 
 
@@ -2057,9 +2059,18 @@ def perform_container_action(
             podman_action = "rm" if safe_action == "remove" else safe_action
             arguments = ["container", podman_action]
             if safe_action in {"stop", "restart"}:
-                arguments.extend(["--time", "10"])
+                arguments.extend(["--time", str(CONTAINER_STOP_GRACE_SECONDS)])
             arguments.append(record.container_id)
-            _output, error, output_truncated = _run_podman(target.endpoint, arguments)
+            timeout_seconds = (
+                CONTAINER_ACTION_TIMEOUT_SECONDS
+                if safe_action in {"stop", "restart"}
+                else API_TIMEOUT_SECONDS
+            )
+            _output, error, output_truncated = _run_podman(
+                target.endpoint,
+                arguments,
+                timeout_seconds=timeout_seconds,
+            )
             if error or output_truncated:
                 message = (
                     "The local Podman action may have completed before timing out; verify current state before retrying."
@@ -2071,7 +2082,17 @@ def perform_container_action(
             if target.api_prefix is None:
                 return ContainerActionResponse(success=False, **response_info, user_confirmed=True, message="The local container API version is unavailable.")
             method, path = _action_path(safe_action, record.container_id)
-            result = _request(target.endpoint, method, f"{target.api_prefix}{path}")
+            timeout_seconds = (
+                CONTAINER_ACTION_TIMEOUT_SECONDS
+                if safe_action in {"stop", "restart"}
+                else API_TIMEOUT_SECONDS
+            )
+            result = _request(
+                target.endpoint,
+                method,
+                f"{target.api_prefix}{path}",
+                timeout_seconds=timeout_seconds,
+            )
             if result.error:
                 return ContainerActionResponse(success=False, **response_info, user_confirmed=True, message=result.error)
             if result.status not in {200, 201, 204, 304}:
