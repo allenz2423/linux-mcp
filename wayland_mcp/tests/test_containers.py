@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -88,3 +89,75 @@ def test_podman_graceful_actions_allow_the_configured_stop_timeout(
     ]
     assert observed["timeout_seconds"] == containers.CONTAINER_ACTION_TIMEOUT_SECONDS
     assert observed["timeout_seconds"] > containers.CONTAINER_STOP_GRACE_SECONDS
+
+
+def test_podman_inspect_uses_immutable_image_id_over_configured_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_id = "a" * 64
+    container_id = "b" * 64
+    tag = "localhost/test-image:latest"
+    record = containers._TokenRecord(
+        endpoint=containers._Endpoint("podman", "user", podman_binary="/usr/bin/podman"),
+        api_prefix=None,
+        container_id=container_id,
+        name="test-container",
+        image="sha256:" + image_id,
+        expires_at=0.0,
+    )
+    inspect = {
+        "Id": container_id,
+        "Image": image_id,
+        "ImageName": tag,
+        "Name": "test-container",
+        "Config": {"Image": tag, "User": "65534:65534", "Env": []},
+        "HostConfig": {
+            "ReadonlyRootfs": True,
+            "SecurityOpt": ["no-new-privileges"],
+        },
+        "State": {"Status": "created"},
+        "NetworkSettings": {"Networks": {}},
+    }
+
+    monkeypatch.setattr(
+        containers,
+        "_run_podman",
+        lambda *_args, **_kwargs: (json.dumps([inspect]), None, False),
+    )
+
+    target, error = containers._read_target(record)
+
+    assert error is None
+    assert target is not None
+    assert target.image == image_id
+    assert target.container_user == "65534:65534"
+    assert target.read_only_rootfs is True
+    assert target.no_new_privileges is True
+
+
+def test_podman_container_token_uses_image_id_from_list_item() -> None:
+    image_id = "a" * 64
+    endpoint = containers._Endpoint("podman", "user", podman_binary="/usr/bin/podman")
+    item, error = containers._parse_list_item(
+        {
+            "Id": "b" * 64,
+            "Names": ["test-container"],
+            "Image": "localhost/test-image:latest",
+            "ImageID": image_id,
+            "State": "created",
+        },
+        endpoint,
+    )
+
+    assert error is None
+    assert item is not None
+    assert item["image"] == "localhost/test-image:latest"
+    token = containers._issue_token(endpoint, None, item)
+    try:
+        record, error = containers._token_record(token)
+        assert error is None
+        assert record is not None
+        assert record.image == image_id
+    finally:
+        with containers._TOKEN_LOCK:
+            containers._TOKENS.pop(token, None)

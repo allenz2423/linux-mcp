@@ -393,6 +393,7 @@ def _parse_list_item(raw: object, endpoint: _Endpoint) -> tuple[dict[str, str | 
     if not name:
         name = _clean_text(raw.get("Name"), 128)
     image = _clean_text(raw.get("Image", raw.get("ImageName")), 256) or "(unknown image)"
+    image_identity = _image_id(raw.get("ImageID", raw.get("ImageId")))
     raw_state = _clean_text(raw.get("State", raw.get("Status")), 32).casefold()
     state = raw_state if raw_state in CONTAINER_STATES else "unknown"
     status = _clean_text(raw.get("Status", raw.get("State")), 160) or state
@@ -403,6 +404,7 @@ def _parse_list_item(raw: object, endpoint: _Endpoint) -> tuple[dict[str, str | 
         "container_id": identifier,
         "name": name or identifier[:12],
         "image": image,
+        "image_identity": image_identity,
         "state": state,
         "status": status,
         "created_at": created,
@@ -475,7 +477,7 @@ def _issue_token(endpoint: _Endpoint, api_prefix: str | None, item: dict[str, st
             api_prefix=api_prefix,
             container_id=str(item["container_id"]),
             name=str(item["name"]),
-            image=str(item["image"]),
+            image=str(item.get("image_identity") or item["image"]),
             expires_at=time.monotonic() + TOKEN_TTL_SECONDS,
         )
     return identity_token
@@ -1881,6 +1883,11 @@ def _read_target(record: _TokenRecord) -> tuple[_ContainerTarget | None, str | N
     name = _clean_text(raw_name.lstrip("/") if isinstance(raw_name, str) else "", 128)
     config = payload.get("Config")
     image_value = config.get("Image") if isinstance(config, dict) else None
+    # Podman reports the configured tag in Config.Image and the immutable
+    # image ID in the top-level Image field. Prefer an ID so the identity
+    # check below can compare it with the one captured at confirmation.
+    if _image_id(image_value) is None:
+        image_value = payload.get("Image") or payload.get("ImageName")
     image = _clean_text(image_value or payload.get("ImageName"), 256)
     if not name:
         name = record.name
