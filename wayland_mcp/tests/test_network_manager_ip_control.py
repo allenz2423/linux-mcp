@@ -41,6 +41,25 @@ def test_ip_profile_reader_parses_nmcli_multiline_selected_properties(monkeypatc
     assert command[command.index("--mode") + 1] == "multiline"
 
 
+def test_ip_profile_reader_parses_ipv6_colons_in_multiline_values(monkeypatch):
+    output = (
+        f"connection.uuid:{PROFILE_UUID}\n"
+        "connection.id:Audit bridge\n"
+        "connection.type:bridge\n"
+        "ipv6.method:manual\n"
+        "ipv6.addresses:2001:db8::20/64\n"
+        "ipv6.gateway:\n"
+    )
+    _patch_nmcli(monkeypatch, output)
+
+    response = ip_control.get_network_manager_profile_ip(PROFILE_UUID, "ipv6")
+
+    assert response.success
+    assert response.method == "manual"
+    assert response.addresses == ["2001:db8::20/64"]
+    assert response.gateway is None
+
+
 def test_ip_profile_reader_fails_closed_on_missing_property(monkeypatch):
     output = (
         f"connection.uuid:{PROFILE_UUID}\n"

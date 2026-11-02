@@ -78,29 +78,31 @@ def _normalized_uuid(value: object) -> tuple[str | None, str | None]:
         return None, "profile_uuid is not a valid NetworkManager UUID."
 
 
-def _split_terse_row(row: str, expected_fields: int) -> list[str] | None:
-    fields: list[str] = []
-    field: list[str] = []
+def _split_multiline_property(row: str, expected_keys: set[str]) -> tuple[str, str] | None:
+    """Parse nmcli multiline output, whose values may contain literal colons."""
+    separator = row.find(":")
+    if separator <= 0:
+        return None
+    key = row[:separator]
+    if key not in expected_keys:
+        return None
+    value: list[str] = []
     escaped = False
-    for character in row:
+    for character in row[separator + 1:]:
         if escaped:
             if character not in {"\\", ":"}:
                 return None
-            field.append(character)
+            value.append(character)
             escaped = False
         elif character == "\\":
             escaped = True
-        elif character == ":":
-            fields.append("".join(field))
-            field.clear()
         elif not character.isprintable():
             return None
         else:
-            field.append(character)
+            value.append(character)
     if escaped:
         return None
-    fields.append("".join(field))
-    return fields if len(fields) == expected_fields else None
+    return key, "".join(value)
 
 
 def _empty_value(value: str) -> bool:
@@ -181,8 +183,9 @@ def _read_profile_snapshot(
     rows = [line for line in output.splitlines() if line]
     values: dict[str, str] = {}
     malformed = False
+    expected_keys = set(fields)
     for row in rows:
-        parsed = _split_terse_row(row, 2)
+        parsed = _split_multiline_property(row, expected_keys)
         if parsed is None:
             malformed = True
             continue
