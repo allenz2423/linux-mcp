@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import pytest
-from dbus_next.errors import InterfaceNotFoundError, InvalidMemberNameError
+from dbus_next.errors import DBusError, InterfaceNotFoundError, InvalidMemberNameError
 
-from wayland_mcp.portal import PortalError, RemoteDesktopPortal, _PortalBus, _parse_portal_introspection
+from wayland_mcp.portal import PortalError, RemoteDesktopPortal, ScreenshotPortal, _PortalBus, _parse_portal_introspection
 
 
 def test_portal_introspection_drops_invalid_properties_and_keeps_methods():
@@ -58,6 +58,23 @@ async def test_portal_response_preserves_bounded_backend_rejection_reason():
 
     with pytest.raises(PortalError, match="prompt executable unavailable"):
         await bus.wait_response("/request")
+
+
+@pytest.mark.asyncio
+async def test_screenshot_method_dbus_error_becomes_a_bounded_portal_error(monkeypatch):
+    portal = ScreenshotPortal()
+
+    class ScreenshotInterface:
+        async def call_screenshot(self, *_args):
+            raise DBusError("org.freedesktop.DBus.Error.Failed", "Unavailable screenshot target 8")
+
+    async def fake_proxy(*_args, **_kwargs):
+        return ScreenshotInterface()
+
+    monkeypatch.setattr(portal, "proxy", fake_proxy)
+
+    with pytest.raises(PortalError, match="The screenshot portal rejected the request.*Unavailable screenshot target 8"):
+        await portal.capture(scope="window")
 
 
 @pytest.mark.asyncio

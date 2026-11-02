@@ -213,7 +213,14 @@ class ScreenshotPortal(_PortalBus):
             "target": Variant("u", 1 if scope == "desktop" else 8),
             "modal": Variant("b", True),
         }
-        request_path = await iface.call_screenshot("", options)
+        try:
+            request_path = await iface.call_screenshot("", options)
+        except DBusError as exc:
+            reason = " ".join((exc.text or "").split())[:240]
+            message = "The screenshot portal rejected the request."
+            if reason:
+                message += f" {reason}"
+            raise PortalError(message) from exc
         response = await self.wait_response(request_path)
         uri = response.get("uri")
         if not isinstance(uri, str):
