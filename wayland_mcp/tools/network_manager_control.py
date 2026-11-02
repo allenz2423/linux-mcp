@@ -29,6 +29,7 @@ PROFILE_ACTIONS = {
 }
 PROFILE_FIELDS = "UUID,NAME,TYPE,DEVICE,AUTOCONNECT"
 MAX_OUTPUT_BYTES = 256 * 1024
+MAX_PROFILE_ROWS = 4_096
 MAX_ACTIVE_ROWS = 4_096
 QUERY_TIMEOUT_SECONDS = 5
 ACTION_WAIT_SECONDS = 12
@@ -85,7 +86,7 @@ def _read_exact_profile(
         [
             "--wait", str(QUERY_TIMEOUT_SECONDS),
             "--terse", "--escape", "yes", "--fields", PROFILE_FIELDS,
-            "connection", "show", "uuid", profile_uuid,
+            "connection", "show",
         ],
         env,
         label="Exact NetworkManager profile inspection",
@@ -96,12 +97,22 @@ def _read_exact_profile(
     if truncated:
         return None, "The exact NetworkManager profile response exceeded its output limit."
     rows = [row for row in output.splitlines() if row]
-    if len(rows) != 1:
-        return None, "NetworkManager did not return exactly one row for the requested profile UUID."
-    profile = _parse_profile_row(rows[0])
-    if profile is None or profile.uuid != profile_uuid:
-        return None, "NetworkManager returned a malformed or mismatched profile identity."
-    return profile, None
+    if len(rows) > MAX_PROFILE_ROWS:
+        return None, "The NetworkManager profile inventory exceeded its row limit."
+    seen: set[str] = set()
+    selected: NetworkManagerProfileInfo | None = None
+    for row in rows:
+        profile = _parse_profile_row(row)
+        if profile is None:
+            return None, "NetworkManager returned a malformed profile row."
+        if profile.uuid in seen:
+            return None, "NetworkManager returned a duplicate profile UUID."
+        seen.add(profile.uuid)
+        if profile.uuid == profile_uuid:
+            selected = profile
+    if selected is None:
+        return None, "The exact NetworkManager profile UUID is no longer present in the current inventory."
+    return selected, None
 
 
 def _read_active_profile_counts(

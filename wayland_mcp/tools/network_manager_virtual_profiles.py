@@ -39,6 +39,39 @@ BOND_MODES = frozenset({
     "active-backup", "balance-rr", "balance-xor", "broadcast", "802.3ad", "balance-tlb", "balance-alb",
 })
 PROFILE_FIELDS = "UUID,NAME,TYPE,DEVICE,AUTOCONNECT"
+PORT_MEMBERSHIP_FIELDS = (
+    "connection.uuid",
+    "connection.interface-name",
+    "connection.autoconnect",
+    "connection.controller",
+    "connection.port-type",
+    "ipv4.method",
+    "ipv6.method",
+    "ipv4.addresses",
+    "ipv4.gateway",
+    "ipv4.dns",
+    "ipv4.dns-search",
+    "ipv4.dns-options",
+    "ipv4.ignore-auto-dns",
+    "ipv4.dns-priority",
+    "ipv4.routes",
+    "ipv6.addresses",
+    "ipv6.gateway",
+    "ipv6.dns",
+    "ipv6.dns-search",
+    "ipv6.dns-options",
+    "ipv6.ignore-auto-dns",
+    "ipv6.dns-priority",
+    "ipv6.routes",
+)
+PORT_DEFAULT_IP_SETTINGS = {
+    "ipv4.method": "auto",
+    "ipv6.method": "auto",
+    "ipv4.ignore-auto-dns": "no",
+    "ipv6.ignore-auto-dns": "no",
+    "ipv4.dns-priority": "0",
+    "ipv6.dns-priority": "0",
+}
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_PROFILE_ROWS = 5_000
 QUERY_TIMEOUT_SECONDS = 6
@@ -275,7 +308,7 @@ def _read_ethernet_device_type(
         [
             binary,
             "--wait", str(QUERY_TIMEOUT_SECONDS),
-            "--get-values", "GENERAL.TYPE,GENERAL.MANAGED",
+            "--get-values", "GENERAL.TYPE,GENERAL.NM-MANAGED",
             "device", "show", interface_name,
         ],
         env,
@@ -363,15 +396,12 @@ def _read_port_membership(
     env: dict[str, str],
     profile_uuid: str,
 ) -> tuple[tuple[str, ...] | None, str | None]:
-    fields = (
-        "connection.uuid,connection.interface-name,connection.autoconnect,connection.controller,connection.port-type,"
-        "ipv4.method,ipv6.method"
-    )
+    fields = PORT_MEMBERSHIP_FIELDS
     output, error, truncated = run_bounded_command(
         [
             binary,
             "--wait", str(QUERY_TIMEOUT_SECONDS),
-            "--terse", "--escape", "yes", "--fields", fields,
+            "--terse", "--escape", "yes", "--mode", "multiline", "--fields", ",".join(fields),
             "connection", "show", "uuid", profile_uuid,
         ],
         env,
@@ -381,13 +411,69 @@ def _read_port_membership(
     )
     if error or output is None or truncated:
         return None, "The new NetworkManager port profile could not be read back."
-    rows = [line for line in output.splitlines() if line]
-    if len(rows) != 1:
-        return None, "NetworkManager did not return exactly one port-profile row."
-    values = _split_terse_row(rows[0], 7)
-    if values is None:
-        return None, "NetworkManager returned a malformed port-profile row."
-    return tuple(values), None
+    values: dict[str, str] = {}
+    malformed = False
+    for row in (line for line in output.splitlines() if line):
+        parsed = _split_terse_row(row, 2)
+        if parsed is None:
+            malformed = True
+            continue
+        key, value = parsed
+        if key not in fields or key in values:
+            malformed = True
+            continue
+        values[key] = value
+    required = set(fields[:5])
+    ip_fields = set(fields[5:])
+    controller = values.get("connection.controller", "")
+    port_type = values.get("connection.port-type", "")
+    attached = controller not in {"", "--"} and port_type not in {"", "--"}
+    missing_ip_fields = ip_fields - values.keys()
+    if malformed or not required <= values.keys():
+        return None, "NetworkManager did not return exactly one complete port-profile field set."
+    if missing_ip_fields and (not attached or missing_ip_fields != ip_fields):
+        return None, "NetworkManager returned an incomplete IP settings field set for the Ethernet profile."
+    return tuple(values.get(field, "") for field in fields), None
+
+
+def _default_port_ip_settings(membership: tuple[str, ...]) -> bool:
+    if len(membership) != len(PORT_MEMBERSHIP_FIELDS):
+        return False
+    for field, value in zip(PORT_MEMBERSHIP_FIELDS[5:], membership[5:]):
+        normalized = value.strip().casefold()
+        expected = PORT_DEFAULT_IP_SETTINGS.get(field)
+        if expected is not None:
+            allowed = {expected}
+            if expected == "no":
+                allowed.add("")
+            if normalized not in allowed:
+                return False
+        elif normalized not in {"", "--", "-"}:
+            return False
+    return True
+
+
+def _detached_port_ip_settings(membership: tuple[str, ...]) -> bool:
+    if len(membership) != len(PORT_MEMBERSHIP_FIELDS):
+        return False
+    values = dict(zip(PORT_MEMBERSHIP_FIELDS, membership))
+    for field, expected in PORT_DEFAULT_IP_SETTINGS.items():
+        allowed = {expected}
+        if expected == "no":
+            allowed.add("")
+        if values[field].strip().casefold() not in allowed:
+            return False
+    return all(
+        values[field].strip() in {"", "--", "-"}
+        for field in PORT_MEMBERSHIP_FIELDS[5:]
+        if field not in PORT_DEFAULT_IP_SETTINGS
+    )
+
+
+def _attached_port_ip_settings(membership: tuple[str, ...]) -> bool:
+    return len(membership) == len(PORT_MEMBERSHIP_FIELDS) and all(
+        value.strip() in {"", "--", "-"} for value in membership[5:]
+    )
 
 
 def network_manager_port_membership_confirmation_details(
@@ -438,8 +524,7 @@ def network_manager_port_membership_confirmation_details(
         membership[0] != port.uuid
         or membership[1] != port.interface_name
         or membership[2].casefold() not in {"yes", "no", "true", "false"}
-        or len(membership[5]) > 64
-        or len(membership[6]) > 64
+        or any(len(value) > 4_096 for value in membership[5:])
     ):
         return None, "The Ethernet profile's UUID, pinned interface, or autoconnect setting could not be read unambiguously."
     controller_values = {controller.uuid}
@@ -449,6 +534,11 @@ def network_manager_port_membership_confirmation_details(
     current_port_type = None if membership[4] in {"", "--"} else membership[4].casefold()
     if action == "add" and (current_controller is not None or current_port_type is not None):
         return None, "The Ethernet profile is already assigned to a controller; detach it explicitly before reassigning."
+    if action == "add" and not _default_port_ip_settings(membership):
+        return None, (
+            "Only Ethernet profiles with automatic IPv4/IPv6 methods and no saved addresses, gateways, DNS overrides, "
+            "or static routes can be attached safely. Move custom IP settings to the bridge/bond profile first."
+        )
     if action == "remove" and (
         current_controller not in controller_values or current_port_type != controller_type
     ):
@@ -578,8 +668,11 @@ def perform_network_manager_port_membership_action(
             and membership[0] == current.before_membership[0]
             and membership[1] == current.before_membership[1]
             and membership[2] == current.before_membership[2]
-            and membership[5] == current.before_membership[5]
-            and membership[6] == current.before_membership[6]
+            and (
+                _attached_port_ip_settings(membership)
+                if target.action == "add"
+                else _detached_port_ip_settings(membership)
+            )
             and (
                 membership[3] in expected_controller
                 and membership[4].casefold() == target.controller_type
@@ -597,12 +690,17 @@ def perform_network_manager_port_membership_action(
                 message=membership_error or "NetworkManager accepted the command, but the exact saved port membership could not be verified; inspect the profile before retrying.",
             )
         verb = "attached to" if target.action == "add" else "detached from"
+        ip_result = (
+            "IP settings are now supplied by the bridge/bond controller."
+            if target.action == "add"
+            else "NetworkManager verified automatic IPv4/IPv6 methods with no saved addresses, gateways, DNS overrides, or static routes."
+        )
         return NetworkManagerPortMembershipResponse(
             success=True, **values, user_confirmed=True,
             message=(
                 f"Saved Ethernet profile {target.profile_name!r} {verb} the selected NetworkManager "
                 f"{target.controller_type}. The saved membership was verified without activating, deactivating, or reapplying the profile. "
-                "Existing autoconnect and IPv4/IPv6 settings were preserved; a later activation or reapply may change traffic."
+                f"Autoconnect was preserved. {ip_result} A later activation or reapply may change traffic."
             ),
         )
 
@@ -691,8 +789,6 @@ def perform_network_manager_port_profile_creation(
                 "connection.controller", current.controller_uuid,
                 "connection.port-type", current.controller_type,
                 "connection.autoconnect", "no",
-                "ipv4.method", "disabled",
-                "ipv6.method", "disabled",
             ],
             env,
             command_label="Create confirmed inactive NetworkManager bridge/bond port profile",
@@ -755,8 +851,7 @@ def perform_network_manager_port_profile_creation(
             and membership[2].casefold() in {"no", "false"}
             and membership[3] in controller_values
             and membership[4].casefold() == current.controller_type
-            and membership[5].casefold() == "disabled"
-            and membership[6].casefold() == "disabled"
+            and _attached_port_ip_settings(membership)
         )
         if not verified:
             return NetworkManagerPortProfileCreateResponse(
@@ -771,7 +866,7 @@ def perform_network_manager_port_profile_creation(
             user_confirmed=True,
             message=(
                 "Created and verified an inactive Ethernet port profile attached to the selected NetworkManager "
-                f"{current.controller_type} profile. Autoconnect and IPv4/IPv6 are disabled. The live interface "
+                f"{current.controller_type} profile. Autoconnect is disabled; the controller supplies IP configuration. The live interface "
                 "was not switched; activating this port profile later can interrupt traffic on that interface."
             ),
         )

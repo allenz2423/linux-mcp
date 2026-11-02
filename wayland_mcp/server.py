@@ -4532,8 +4532,9 @@ async def _confirm_network_manager_profile_action(
             "and this profile will not autoconnect again until reboot or a later user action."
         ),
         "enable_autoconnect": (
-            "This saves the autoconnect setting in the profile and may activate it later when NetworkManager "
-            "finds suitable resources; it does not activate the profile immediately."
+            "This saves the autoconnect setting in the profile. NetworkManager may activate the profile as a "
+            "result of this change or later when suitable resources are available; the tool does not issue a "
+            "separate activation command."
         ),
         "disable_autoconnect": (
             "This saves the autoconnect setting in the profile and affects future automatic activation; "
@@ -4947,10 +4948,11 @@ async def _confirm_network_manager_port_profile_creation(
     return Elicit(
         f"Confirm saving inactive Ethernet port profile {target.profile_name!r} for interface "
         f"{target.interface_name!r} on NetworkManager {target.controller_type} profile "
-        f"{target.controller_name!r} (UUID {target.controller_uuid})? The profile will have autoconnect "
-        "disabled and IPv4/IPv6 disabled. The complete profile inventory, controller identity, and Ethernet "
-        "device identity are re-read after confirmation. The live interface will not be switched; activating "
-        "this profile later may interrupt traffic. Current OS permissions apply; the server requests no privilege "
+        f"{target.controller_name!r} (UUID {target.controller_uuid})? Autoconnect will be disabled. "
+        "NetworkManager does not store IPv4/IPv6 settings on an attached Ethernet port profile; the selected "
+        "bridge or bond controller supplies IP configuration. The complete profile inventory, controller identity, "
+        "and Ethernet device identity are re-read after confirmation. The live interface will not be switched; "
+        "activating this profile later may interrupt traffic. Current OS permissions apply; the server requests no privilege "
         "elevation. Repeat the exact controller UUID, profile name, interface name, and state-bound phrase. "
         f"Type {target.confirmation_phrase!r} and confirm.",
         NetworkManagerPortProfileCreateConfirmation,
@@ -4973,15 +4975,19 @@ async def _confirm_network_manager_port_membership(
     verb = "attach" if target.action == "add" else "detach"
     activity = "active" if target.profile_active else "inactive"
     autoconnect = target.before_membership[2]
-    ipv4_method = target.before_membership[5]
-    ipv6_method = target.before_membership[6]
+    ip_effect = (
+        "The current profile has automatic IPv4/IPv6 methods with no saved addresses, gateways, DNS overrides, or static routes. "
+        "NetworkManager omits per-port IP settings while attached; the bridge/bond controller supplies IP configuration."
+        if target.action == "add"
+        else "NetworkManager omits per-port IP settings while attached. Detaching will leave IPv4/IPv6 methods automatic "
+        "with no saved addresses, gateways, DNS overrides, or static routes; the profile remains inactive unless activated later."
+    )
     return Elicit(
         f"Confirm saving the {verb} of {activity} Ethernet profile {target.profile_name!r} "
         f"(UUID {target.profile_uuid}, interface {target.interface_name}) "
         f"{'to' if target.action == 'add' else 'from'} NetworkManager {target.controller_type} profile "
-        f"{target.controller_name!r} (UUID {target.controller_uuid})? Current saved settings: "
-        f"autoconnect={autoconnect}, IPv4 method={ipv4_method}, IPv6 method={ipv6_method}. "
-        "The tool changes only controller/port-type and preserves those settings. The full profile inventory, "
+        f"{target.controller_name!r} (UUID {target.controller_uuid})? Current autoconnect={autoconnect}. {ip_effect} "
+        "The full profile inventory, "
         "selected membership properties, and interface identity are bound to this confirmation and re-read "
         "before and after the saved change. It does not activate, deactivate, or reapply either profile; if the "
         "profile is active, its applied settings remain in use until NetworkManager reapplies or reactivates it. "
@@ -7294,7 +7300,7 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
             confirmed_phrase=confirmation.data.confirmation_phrase,
         )
 
-    @tool(name="create_network_manager_port_profile", description="After exact client confirmation, create one persistent inactive Ethernet port profile attached to an exact saved NetworkManager bridge or bond UUID. The named interface must be a currently NetworkManager-managed Ethernet device. The new profile has autoconnect and IPv4/IPv6 disabled and does not switch the live interface. Full profile, controller, and device identity are bound to confirmation and revalidated. Later activation can interrupt traffic; the tool uses current OS permissions without elevation.")
+    @tool(name="create_network_manager_port_profile", description="After exact client confirmation, create one persistent inactive Ethernet port profile attached to an exact saved NetworkManager bridge or bond UUID. The named interface must be a currently NetworkManager-managed Ethernet device. Autoconnect is disabled and the live interface is not switched. NetworkManager does not store IPv4/IPv6 settings on an attached port profile; the bridge/bond controller supplies IP configuration. Full profile, controller, and device identity are bound to confirmation and revalidated. Later activation can interrupt traffic; the tool uses current OS permissions without elevation.")
     async def tool_create_network_manager_port_profile(
         controller_uuid: str,
         profile_name: str,
@@ -7321,7 +7327,7 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
             confirmed_phrase=confirmation.data.confirmation_phrase,
         )
 
-    @tool(name="manage_network_manager_port_membership", description="After exact client confirmation, attach or detach one exact pinned NetworkManager Ethernet profile to one saved bridge or bond UUID. Supports active profiles and preserves their current autoconnect and IPv4/IPv6 methods. Binds the complete profile inventory, membership fields, and interface identity to confirmation and revalidates them. Changes saved controller/port-type only; it does not activate, deactivate, or reapply either profile. For an active profile, the applied settings remain in use until NetworkManager reapplies or reactivates it; a later activation/reapply may change traffic. Uses current OS permissions without elevation.")
+    @tool(name="manage_network_manager_port_membership", description="After exact client confirmation, attach or detach one exact pinned NetworkManager Ethernet profile to one saved bridge or bond UUID. Attaching is allowed only when the saved IPv4/IPv6 methods are automatic and there are no saved addresses, gateways, DNS overrides, or static routes. NetworkManager omits per-port IP settings while attached; the bridge/bond controller supplies IP configuration. Detaching leaves automatic IP methods and empty saved address/DNS/route lists. Autoconnect is preserved. Binds the complete profile inventory, IP settings, membership fields, and interface identity to confirmation and revalidates them. It does not activate, deactivate, or reapply either profile; a later activation/reapply may change traffic. Uses current OS permissions without elevation.")
     async def tool_manage_network_manager_port_membership(
         action: Literal["add", "remove"],
         profile_uuid: str,

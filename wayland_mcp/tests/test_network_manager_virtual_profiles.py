@@ -67,3 +67,65 @@ def test_virtual_profile_snapshot_detects_inactive_saved_interface_binding(monke
 
     assert snapshot is None
     assert error == "A NetworkManager profile already targets that interface name."
+
+
+def test_port_membership_reader_parses_nmcli_multiline_selected_properties(monkeypatch):
+    output = (
+        f"connection.uuid:{ETHERNET_UUID}\n"
+        "connection.interface-name:enp42s0\n"
+        "connection.autoconnect:no\n"
+        "connection.controller:br-test\n"
+        "connection.port-type:bridge\n"
+    )
+    calls = []
+
+    def run(command, _env, **kwargs):
+        calls.append((command, kwargs))
+        return output, None, False
+
+    monkeypatch.setattr(profiles, "run_bounded_command", run)
+
+    membership, error = profiles._read_port_membership("/usr/bin/nmcli", {}, ETHERNET_UUID)
+
+    assert error is None
+    assert membership[:5] == (
+        ETHERNET_UUID,
+        "enp42s0",
+        "no",
+        "br-test",
+        "bridge",
+    )
+    assert membership[5:] == ("",) * len(profiles.PORT_MEMBERSHIP_FIELDS[5:])
+    command = calls[0][0]
+    assert command[command.index("--mode") + 1] == "multiline"
+
+
+def test_membership_add_accepts_only_default_ip_settings():
+    defaults = tuple(
+        profiles.PORT_DEFAULT_IP_SETTINGS.get(field, "")
+        for field in profiles.PORT_MEMBERSHIP_FIELDS[5:]
+    )
+    membership = (ETHERNET_UUID, "enp42s0", "no", "", "", *defaults)
+
+    assert profiles._default_port_ip_settings(membership)
+    assert not profiles._default_port_ip_settings(
+        membership[:5] + ("manual",) + membership[6:]
+    )
+
+
+def test_port_profile_device_check_uses_nmcli_managed_property(monkeypatch):
+    calls = []
+
+    def run(command, _env, **kwargs):
+        calls.append((command, kwargs))
+        return "ethernet\nyes\n", None, False
+
+    monkeypatch.setattr(profiles, "run_bounded_command", run)
+
+    device_type, error = profiles._read_ethernet_device_type(
+        "/usr/bin/nmcli", {}, "enp42s0"
+    )
+
+    assert error is None
+    assert device_type == "ethernet"
+    assert calls[0][0][calls[0][0].index("--get-values") + 1] == "GENERAL.TYPE,GENERAL.NM-MANAGED"
