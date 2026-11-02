@@ -6,7 +6,7 @@ from typing import Optional
 
 from wayland_mcp.backends.registry import detect_backend
 from wayland_mcp.models import ScreenshotResponse, WindowGeometry
-from wayland_mcp.png import crop_png, png_dimensions
+from wayland_mcp.png import coordinate_grid_png, crop_png, png_dimensions
 from wayland_mcp.portal import PortalError, remote_desktop_portal
 from wayland_mcp.safety.tokens import snapshot_token_manager
 from wayland_mcp.tools.windows import _allowed_window_operations
@@ -17,7 +17,15 @@ MAX_SCREENSHOT_BYTES = 32 * 1024 * 1024
 async def capture_screenshot(
     scope: str = "window",
     target: Optional[str] = None,
+    grid_interval: int = 100,
 ) -> tuple[ScreenshotResponse, bytes]:
+    if not isinstance(grid_interval, int) or isinstance(grid_interval, bool) or not 50 <= grid_interval <= 1000:
+        return ScreenshotResponse(
+            success=False,
+            scope=scope if scope in {"window", "desktop"} else "window",
+            target=target,
+            message="Pixel grid interval must be an integer from 50 through 1000.",
+        ), b""
     if scope not in {"window", "desktop"}:
         return ScreenshotResponse(success=False, scope=scope, target=target, message="Scope must be 'window' or 'desktop'."), b""
     if scope == "desktop" and target is not None:
@@ -129,6 +137,16 @@ async def capture_screenshot(
         width, height = png_dimensions(image)
     except ValueError as exc:
         return ScreenshotResponse(success=False, scope=scope, target=target, message=str(exc)), b""
+
+    try:
+        image = coordinate_grid_png(image, interval=grid_interval)
+        message = (
+            f"{message or 'Screenshot captured.'} Coordinate grid: x labels run across the top and y labels down the left "
+            f"at {grid_interval}-pixel intervals, relative to the screenshot's top-left corner. Grid values are image pixels; "
+            "scale them to the reported window geometry before pointer input if the image and window dimensions differ."
+        )
+    except ValueError as exc:
+        message = f"{message or 'Screenshot captured.'} Pixel coordinate grid unavailable: {exc}"
 
     observed_windows = [selected_window] if selected_window is not None and scope == "window" else []
     allowed = set() if scope == "desktop" else _allowed_window_operations(backend)

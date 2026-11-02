@@ -21,16 +21,11 @@ def png_dimensions(image: bytes) -> tuple[int, int]:
     return width, height
 
 
-def crop_png(image: bytes, x: int, y: int, width: int, height: int) -> bytes:
-    """Crop an 8-bit RGB/RGBA non-interlaced PNG using only the standard library."""
+def _decode_rgb_png(image: bytes) -> tuple[int, int, int, bytearray]:
+    """Decode a bounded 8-bit RGB/RGBA non-interlaced PNG."""
     if len(image) > MAX_PNG_BYTES:
         raise ValueError("Screenshot exceeds the 32 MiB input limit.")
     image_width, image_height = png_dimensions(image)
-    if any(not isinstance(value, int) or isinstance(value, bool) for value in (x, y, width, height)):
-        raise ValueError("Crop bounds must be integers.")
-    if x < 0 or y < 0 or width <= 0 or height <= 0 or x + width > image_width or y + height > image_height:
-        raise ValueError("Crop bounds fall outside the screenshot.")
-
     offset = len(PNG_SIGNATURE)
     compressed: list[bytes] = []
     header: tuple[int, int, int, int, int, int, int] | None = None
@@ -63,7 +58,7 @@ def crop_png(image: bytes, x: int, y: int, width: int, height: int) -> bytes:
     if (encoded_width, encoded_height) != (image_width, image_height):
         raise ValueError("PNG header dimensions changed during parsing.")
     if bit_depth != 8 or color_type not in {2, 6} or compression != 0 or filtering != 0 or interlace != 0:
-        raise ValueError("Only 8-bit RGB/RGBA non-interlaced screenshots can be cropped.")
+        raise ValueError("Only 8-bit RGB/RGBA non-interlaced screenshots can be processed.")
     bytes_per_pixel = 3 if color_type == 2 else 4
     stride = image_width * bytes_per_pixel
     decoded_limit = (stride + 1) * image_height
@@ -79,10 +74,10 @@ def crop_png(image: bytes, x: int, y: int, width: int, height: int) -> bytes:
     if len(raw) != decoded_limit:
         raise ValueError("PNG pixel data has an invalid length.")
 
-    rows: list[bytes] = []
+    pixels = bytearray(stride * image_height)
     previous = bytearray(stride)
     cursor = 0
-    for _row_number in range(image_height):
+    for row_number in range(image_height):
         filter_type = raw[cursor]
         encoded = raw[cursor + 1 : cursor + 1 + stride]
         cursor += stride + 1
@@ -110,28 +105,166 @@ def crop_png(image: bytes, x: int, y: int, width: int, height: int) -> bytes:
                     above if above_distance <= upper_left_distance else upper_left
                 )
             row[index] = (value + predictor) & 0xFF
-        rows.append(bytes(row))
+        row_start = row_number * stride
+        pixels[row_start : row_start + stride] = row
         previous = row
+    return image_width, image_height, bytes_per_pixel, pixels
 
-    start = x * bytes_per_pixel
-    end = (x + width) * bytes_per_pixel
-    cropped_pixels = b"".join(b"\x00" + row[start:end] for row in rows[y : y + height])
-    new_header = struct.pack(">IIBBBBB", width, height, bit_depth, color_type, compression, filtering, interlace)
 
-    def chunk(kind: bytes, payload: bytes) -> bytes:
-        return (
-            len(payload).to_bytes(4, "big")
-            + kind
-            + payload
-            + (zlib.crc32(kind + payload) & 0xFFFFFFFF).to_bytes(4, "big")
-        )
-
-    cropped = (
-        PNG_SIGNATURE
-        + chunk(b"IHDR", new_header)
-        + chunk(b"IDAT", zlib.compress(cropped_pixels, level=6))
-        + chunk(b"IEND", b"")
+def _chunk(kind: bytes, payload: bytes) -> bytes:
+    return (
+        len(payload).to_bytes(4, "big")
+        + kind
+        + payload
+        + (zlib.crc32(kind + payload) & 0xFFFFFFFF).to_bytes(4, "big")
     )
-    if len(cropped) > MAX_PNG_BYTES:
-        raise ValueError("Cropped screenshot exceeds the 32 MiB output limit.")
-    return cropped
+
+
+def _encode_rgb_png(width: int, height: int, channels: int, pixels: bytearray) -> bytes:
+    color_type = 2 if channels == 3 else 6
+    header = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    stride = width * channels
+    compressor = zlib.compressobj(level=6)
+    compressed: list[bytes] = []
+    for row_number in range(height):
+        start = row_number * stride
+        compressed.append(compressor.compress(b"\x00" + bytes(pixels[start : start + stride])))
+    compressed.append(compressor.flush())
+    encoded = PNG_SIGNATURE + _chunk(b"IHDR", header) + _chunk(b"IDAT", b"".join(compressed)) + _chunk(b"IEND", b"")
+    if len(encoded) > MAX_PNG_BYTES:
+        raise ValueError("Processed screenshot exceeds the 32 MiB output limit.")
+    return encoded
+
+
+def crop_png(image: bytes, x: int, y: int, width: int, height: int) -> bytes:
+    """Crop an 8-bit RGB/RGBA non-interlaced PNG using only the standard library."""
+    image_width, image_height, channels, pixels = _decode_rgb_png(image)
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in (x, y, width, height)):
+        raise ValueError("Crop bounds must be integers.")
+    if x < 0 or y < 0 or width <= 0 or height <= 0 or x + width > image_width or y + height > image_height:
+        raise ValueError("Crop bounds fall outside the screenshot.")
+
+    source_stride = image_width * channels
+    crop_stride = width * channels
+    cropped_pixels = bytearray(crop_stride * height)
+    start = x * channels
+    for row_number in range(height):
+        source_start = (y + row_number) * source_stride + start
+        target_start = row_number * crop_stride
+        cropped_pixels[target_start : target_start + crop_stride] = pixels[source_start : source_start + crop_stride]
+    return _encode_rgb_png(width, height, channels, cropped_pixels)
+
+
+_DIGITS = {
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "10000", "11110", "00001", "00001", "11110"),
+    "6": ("01110", "10000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00001", "01110"),
+}
+
+
+def _blend_pixel(
+    pixels: bytearray,
+    offset: int,
+    channels: int,
+    color: tuple[int, int, int],
+    alpha: int,
+) -> None:
+    if channels == 3:
+        inverse = 255 - alpha
+        for channel in range(3):
+            pixels[offset + channel] = (pixels[offset + channel] * inverse + color[channel] * alpha + 127) // 255
+        return
+
+    source_alpha = pixels[offset + 3]
+    output_alpha = alpha + (source_alpha * (255 - alpha) + 127) // 255
+    if output_alpha == 0:
+        return
+    for channel in range(3):
+        source_premultiplied = pixels[offset + channel] * source_alpha * (255 - alpha) // 255
+        output_premultiplied = color[channel] * alpha + source_premultiplied
+        pixels[offset + channel] = min(255, (output_premultiplied + output_alpha // 2) // output_alpha)
+    pixels[offset + 3] = output_alpha
+
+
+def _draw_grid_label(
+    pixels: bytearray,
+    width: int,
+    height: int,
+    channels: int,
+    text: str,
+    anchor_x: int,
+    anchor_y: int,
+    scale: int,
+    *,
+    center_x: bool,
+    center_y: bool,
+) -> None:
+    text_units = len(text) * 5 + max(0, len(text) - 1)
+    box_width = text_units * scale + 4
+    box_height = 7 * scale + 4
+    if box_width > width or box_height > height:
+        return
+    left = anchor_x - box_width // 2 if center_x else anchor_x
+    top = anchor_y - box_height // 2 if center_y else anchor_y
+    left = max(0, min(width - box_width, left))
+    top = max(0, min(height - box_height, top))
+    background = (12, 18, 25)
+    for y in range(top, top + box_height):
+        for x in range(left, left + box_width):
+            _blend_pixel(pixels, (y * width + x) * channels, channels, background, 220)
+
+    cursor_x = left + 2
+    glyph_top = top + 2
+    for character in text:
+        glyph = _DIGITS[character]
+        for glyph_y, glyph_row in enumerate(glyph):
+            for glyph_x, enabled in enumerate(glyph_row):
+                if enabled != "1":
+                    continue
+                for dy in range(scale):
+                    y = glyph_top + glyph_y * scale + dy
+                    for dx in range(scale):
+                        x = cursor_x + glyph_x * scale + dx
+                        _blend_pixel(pixels, (y * width + x) * channels, channels, (255, 255, 255), 255)
+        cursor_x += 6 * scale
+
+
+def coordinate_grid_png(image: bytes, interval: int = 100) -> bytes:
+    """Overlay a numbered x/y pixel grid on an 8-bit RGB/RGBA PNG."""
+    if not isinstance(interval, int) or isinstance(interval, bool) or not 50 <= interval <= 1000:
+        raise ValueError("Pixel grid interval must be an integer from 50 through 1000.")
+    width, height, channels, pixels = _decode_rgb_png(image)
+
+    for x in range(0, width, interval):
+        for y in range(height):
+            _blend_pixel(pixels, (y * width + x) * channels, channels, (30, 210, 255), 120)
+    for y in range(0, height, interval):
+        row_start = y * width
+        for x in range(width):
+            _blend_pixel(pixels, (row_start + x) * channels, channels, (30, 210, 255), 120)
+
+    largest_coordinate = max(width - 1, height - 1)
+    largest_digits = len(str(largest_coordinate))
+    unit_width = largest_digits * 5 + max(0, largest_digits - 1)
+    scale = max(1, min(3, (interval - 4) // unit_width))
+    label_height = 7 * scale + 4
+    for x in range(0, width, interval):
+        _draw_grid_label(pixels, width, height, channels, str(x), x, 2, scale, center_x=True, center_y=False)
+    for y in range(0, height, interval):
+        if y == 0:
+            _draw_grid_label(
+                pixels, width, height, channels, str(y), 2, label_height + 4, scale,
+                center_x=False, center_y=False,
+            )
+        else:
+            _draw_grid_label(pixels, width, height, channels, str(y), 2, y, scale,
+                             center_x=False, center_y=True)
+
+    return _encode_rgb_png(width, height, channels, pixels)

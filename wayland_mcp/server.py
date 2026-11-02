@@ -11863,9 +11863,13 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
     def tool_move_window_to_workspace(target: str, workspace: str, token_id: str) -> ActionResult:
         return _move_window_to_workspace(target, workspace, token_id)
 
-    @tool(name="capture_screenshot", description="Capture a PNG of the desktop or a focused/exact window. Exact targeted captures fail closed when the compositor cannot verify the requested ID; EWMH-compatible X11 uses optional maim for the root window or an exact observed numeric window ID. Wayland fallback uses the monitor ScreenCast stream approved when the MCP server started and never opens a screenshot portal prompt during a tool call. Returns MCP image content and a fresh observation token where available.", structured_output=False)
-    async def tool_capture_screenshot(scope: str = "window", target: str | None = None) -> CallToolResult:
-        response, image_data = await _capture_screenshot(scope=scope, target=target)
+    @tool(name="capture_screenshot", description="Capture a PNG of the desktop or a focused/exact window. Adds a numbered pixel grid by default: x labels run across the top and y labels down the left, relative to the screenshot's top-left, every 100 pixels. Set grid_interval from 50 to 1000 to change spacing. Grid values are image pixels; scale to window geometry before pointer input if image and window dimensions differ. Exact targeted captures fail closed when the compositor cannot verify the requested ID; EWMH-compatible X11 uses optional maim for the root window or an exact observed numeric window ID. Wayland fallback uses the monitor ScreenCast stream approved when the MCP server started and never opens a screenshot portal prompt during a tool call. Returns MCP image content and a fresh observation token where available.", structured_output=False)
+    async def tool_capture_screenshot(
+        scope: str = "window",
+        target: str | None = None,
+        grid_interval: int = 100,
+    ) -> CallToolResult:
+        response, image_data = await _capture_screenshot(scope=scope, target=target, grid_interval=grid_interval)
         content: list[TextContent | ImageContent] = [
             TextContent(text=json.dumps(response.model_dump(mode="json"), ensure_ascii=False))
         ]
