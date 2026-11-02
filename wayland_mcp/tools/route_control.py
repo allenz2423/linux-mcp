@@ -255,11 +255,19 @@ def _parse_route_entry(raw: dict[str, object], spec: RouteSpec) -> RouteEntry | 
     flags = raw.get("flags", [])
     if not isinstance(flags, list):
         return None
+    unsupported_flags = any(
+        not isinstance(flag, str) or flag.casefold() != "linkdown"
+        for flag in flags
+    )
     supported_keys = {
         "dst", "gateway", "via", "dev", "table", "type", "scope", "metric",
         "protocol", "proto", "prefsrc", "src", "pref", "flags",
     }
-    unsupported = bool(set(raw) - supported_keys or flags or preference in {"low", "high"})
+    unsupported = bool(
+        set(raw) - supported_keys
+        or unsupported_flags
+        or preference in {"low", "high"}
+    )
     return RouteEntry(
         destination=destination,
         gateway=gateway,
@@ -292,6 +300,8 @@ def _read_exact_routes(spec: RouteSpec) -> tuple[list[RouteEntry] | None, str | 
         max_output_bytes=MAX_ROUTE_OUTPUT_BYTES,
     )
     if error:
+        if "FIB table does not exist" in error and "Dump terminated" in error:
+            return [], None
         return None, "The exact route state could not be read in the current network namespace."
     if truncated:
         return None, "The exact route response exceeded its output limit."
@@ -359,7 +369,7 @@ def _resolve_target(
         if entry.destination == spec.destination and entry.table == spec.table and entry.metric == spec.metric
     ]
     matching = [entry for entry in entries if _route_matches_spec(entry, spec)]
-    if safe_action == "add":
+    if normalized.action == "add":
         if same_prefix_metric:
             return None, "A route for this exact destination, table, and metric already exists; this tool does not replace or create multipath routes."
         return RouteActionTarget(spec=spec, existing_route=None), None
