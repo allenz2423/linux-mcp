@@ -274,3 +274,5 @@ A live `manage_service reload` check used a temporary user-scope service running
 A live `manage_systemd_timer` start/stop check used a temporary user-scope timer scheduled for 2099 and a matching `/usr/bin/true` service. Exact state-token confirmations were accepted for both actions. Start produced `active/waiting`; the associated service remained inactive, confirming no event fired. Stop returned the timer to `inactive/dead`, and the service remained inactive. Both exact unit files were deleted, and after manager reload systemd reported both units as not found.
 
 A live `manage_time_settings` check accepted exact state-token confirmations for setting the existing `America/New_York` timezone and enabling NTP when it was already enabled. Both actions correctly used their no-write paths; follow-up `get_time_settings` reads confirmed timezone, NTP enablement, and synchronization state were unchanged.
+
+A live `manage_power_profile` check accepted the exact phrase-bound confirmation to change from `performance` to `balanced`; readback matched. A second exact confirmation restored `performance`, and final inventory verified the original profile was active.
