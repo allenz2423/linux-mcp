@@ -891,6 +891,7 @@ from wayland_mcp.tools.filesystem_admin import (
     write_binary_file as _write_binary_file,
 )
 from wayland_mcp.tools.filesystem_uploads import (
+    MAX_BINARY_UPLOAD_BYTES,
     abort_binary_file_upload as _abort_binary_file_upload,
     append_binary_file_upload as _append_binary_file_upload,
     begin_binary_file_upload as _begin_binary_file_upload,
@@ -6734,7 +6735,7 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
     async def tool_begin_binary_file_upload(
         path: str,
         action: Literal["create", "replace"],
-        expected_size: Annotated[int, PydanticField(strict=True, gt=4_194_304, le=4_294_967_296)],
+        expected_size: Annotated[int, PydanticField(strict=True, gt=4_194_304, le=MAX_BINARY_UPLOAD_BYTES)],
         expected_sha256: Annotated[str, PydanticField(pattern=r"^[0-9a-f]{64}$")],
         confirmation: Annotated[
             ElicitationResult[BinaryFileUploadConfirmation],
@@ -6766,7 +6767,7 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
     @tool(name="append_binary_file_upload", description="Append one sequential base64 chunk of up to 4 MiB to a previously confirmed large binary-file upload. Requires its secret short-lived upload_id and the exact next offset. This writes only to the private staging file; it cannot publish the destination. The complete staged size and SHA-256 are rechecked at commit.")
     async def tool_append_binary_file_upload(
         upload_id: Annotated[str, PydanticField(min_length=40, max_length=60)],
-        offset: Annotated[int, PydanticField(strict=True, ge=0, le=4_294_967_296)],
+        offset: Annotated[int, PydanticField(strict=True, ge=0, le=MAX_BINARY_UPLOAD_BYTES)],
         data_base64: Annotated[str, PydanticField(max_length=5_592_408)],
     ) -> BinaryFileUploadResponse:
         return await asyncio.to_thread(_append_binary_file_upload, upload_id, offset, data_base64)

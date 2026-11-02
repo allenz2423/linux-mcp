@@ -57,3 +57,14 @@ def test_unknown_category_or_tool_is_rejected() -> None:
         ToolSelection(disabled_categories=frozenset({"network"}))
     with pytest.raises(ValueError, match="Unknown tool name"):
         ToolSelection(disabled_tools=frozenset({"not_a_real_tool"}))
+
+
+def test_binary_upload_schema_matches_runtime_limit() -> None:
+    from wayland_mcp.tools.filesystem_uploads import MAX_BINARY_UPLOAD_BYTES
+
+    tools = asyncio.run(create_server().list_tools())
+    upload = next(tool for tool in tools if tool.name == "begin_binary_file_upload")
+    append = next(tool for tool in tools if tool.name == "append_binary_file_upload")
+
+    assert upload.input_schema["properties"]["expected_size"]["maximum"] == MAX_BINARY_UPLOAD_BYTES
+    assert append.input_schema["properties"]["offset"]["maximum"] == MAX_BINARY_UPLOAD_BYTES
