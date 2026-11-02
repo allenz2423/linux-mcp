@@ -447,7 +447,7 @@ class HyprlandBackend(BaseCompositorBackend):
         selector = f"address:{match.id}"
         # Hyprland dispatch: resizewindowpixel [pixel_w] [pixel_h],address:<addr>
         args = f"exact {width} {height},{selector}"
-        lua = f"hl.dsp.window.resize({{ window = {_lua_quote(selector)}, width = {width}, height = {height} }})"
+        lua = f"hl.dsp.window.resize({{ window = {_lua_quote(selector)}, x = {width}, y = {height} }})"
         try:
             res = self._dispatch("resizewindowpixel", args, lua_expr=lua)
             if "ok" in res.stdout.lower() or res.returncode == 0:
@@ -623,7 +623,7 @@ class HyprlandBackend(BaseCompositorBackend):
                 requires_reobservation=True,
             )
 
-        lua = f"hl.dsp.workspace.focus({{ workspace = {_lua_quote(ws)} }})"
+        lua = f"hl.dsp.focus({{ workspace = {_lua_quote(ws)} }})"
         try:
             res = self._dispatch("workspace", ws, lua_expr=lua)
             if "ok" in res.stdout.lower() or res.returncode == 0:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from dbus_next.errors import DBusError, InterfaceNotFoundError, InvalidMemberNameError
+from dbus_next.errors import DBusError, InterfaceNotFoundError, InvalidAddressError, InvalidMemberNameError
 
 from wayland_mcp.portal import PortalError, RemoteDesktopPortal, ScreenshotPortal, _PortalBus, _parse_portal_introspection
 
@@ -75,6 +75,22 @@ async def test_screenshot_method_dbus_error_becomes_a_bounded_portal_error(monke
 
     with pytest.raises(PortalError, match="The screenshot portal rejected the request.*Unavailable screenshot target 8"):
         await portal.capture(scope="window")
+
+
+@pytest.mark.asyncio
+async def test_missing_session_bus_address_becomes_a_bounded_portal_error(monkeypatch):
+    portal = _PortalBus()
+    monkeypatch.setattr("wayland_mcp.portal.get_sanitized_env", lambda: {})
+
+    def missing_bus_address(**_kwargs):
+        raise InvalidAddressError("DBUS_SESSION_BUS_ADDRESS not set")
+
+    monkeypatch.setattr("wayland_mcp.portal.MessageBus", missing_bus_address)
+
+    with pytest.raises(PortalError, match="The session D-Bus is unavailable"):
+        await portal.connect()
+
+    assert portal.bus is None
 
 
 @pytest.mark.asyncio

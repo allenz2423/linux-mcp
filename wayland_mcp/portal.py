@@ -19,7 +19,7 @@ from urllib.parse import unquote, urlsplit
 
 from dbus_next import BusType, Message, MessageType, Variant
 from dbus_next.aio import MessageBus
-from dbus_next.errors import DBusError, InterfaceNotFoundError
+from dbus_next.errors import DBusError, InterfaceNotFoundError, InvalidAddressError
 from dbus_next.introspection import Node
 from dbus_next.validators import is_member_name_valid
 
@@ -83,11 +83,15 @@ class _PortalBus:
             return self.bus
         env = get_sanitized_env()
         address = env.get("DBUS_SESSION_BUS_ADDRESS")
-        if address:
-            bus = MessageBus(bus_address=address)
-        else:
-            bus = MessageBus(bus_type=BusType.SESSION)
-        self.bus = await bus.connect()
+        try:
+            if address:
+                bus = MessageBus(bus_address=address)
+            else:
+                bus = MessageBus(bus_type=BusType.SESSION)
+            self.bus = await bus.connect()
+        except (DBusError, InvalidAddressError, OSError, asyncio.TimeoutError) as exc:
+            self.bus = None
+            raise PortalError("The session D-Bus is unavailable for desktop portal access.") from exc
         self.bus.add_message_handler(self._on_message)
         return self.bus
 

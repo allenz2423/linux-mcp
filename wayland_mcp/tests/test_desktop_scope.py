@@ -320,6 +320,60 @@ def test_hyprland_screenshot_fails_fast_when_all_active_outputs_are_dpms_off(mon
     assert "DPMS-off" in message
 
 
+def test_hyprland_lua_workspace_switch_uses_global_focus_dispatcher(monkeypatch):
+    backend = HyprlandBackend(env={"PATH": "/usr/bin"})
+    calls = []
+
+    def dispatch(command, args="", *, lua_expr):
+        calls.append((command, args, lua_expr))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(backend, "_check_lua_support", lambda: True)
+    monkeypatch.setattr(backend, "_dispatch", dispatch)
+
+    result = backend.switch_workspace("-2")
+
+    assert result.success
+    assert calls == [("workspace", "-2", 'hl.dsp.focus({ workspace = "-2" })')]
+
+
+def test_hyprland_lua_resize_uses_supported_dimensions(monkeypatch):
+    backend = HyprlandBackend(env={"PATH": "/usr/bin"})
+    window = WindowInfo(
+        id="0xabc",
+        app_id="org.example.Test",
+        title="Test",
+        geometry=WindowGeometry(x=0, y=0, width=640, height=480),
+    )
+    monkeypatch.setattr(
+        backend,
+        "list_windows",
+        lambda: WindowListResponse(
+            success=True,
+            total_windows=1,
+            compositor="hyprland",
+            windows=[window],
+        ),
+    )
+    monkeypatch.setattr(backend, "_check_lua_support", lambda: True)
+    calls = []
+
+    def dispatch(command, args="", *, lua_expr):
+        calls.append((command, args, lua_expr))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(backend, "_dispatch", dispatch)
+
+    result = backend.resize_window(window.id, 800, 600)
+
+    assert result.success
+    assert calls == [(
+        "resizewindowpixel",
+        "exact 800 600,address:0xabc",
+        'hl.dsp.window.resize({ window = "address:0xabc", x = 800, y = 600 })',
+    )]
+
+
 def test_hyprland_cursor_position_requires_finite_numeric_coordinates(monkeypatch):
     backend = HyprlandBackend(env={"PATH": "/usr/bin"})
     monkeypatch.setattr(backend, "_run_hyprctl", lambda _args: {"x": 41, "y": 82.5})
