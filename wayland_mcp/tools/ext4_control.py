@@ -180,14 +180,18 @@ def _signature_types(device_path: str) -> tuple[str, ...] | None:
     return tuple(sorted(line.strip() for line in result[1].splitlines() if line.strip()))
 
 
-def _filesystem_state(device_path: str) -> tuple[int, int, str | None] | None:
+def _filesystem_state(
+    device_path: str,
+    *,
+    pass_fds: tuple[int, ...] = (),
+) -> tuple[int, int, str | None] | None:
     blkid = find_session_binary("blkid", _environment())
     dumpe2fs = find_session_binary("dumpe2fs", _environment())
     if not blkid or not dumpe2fs:
         return None
-    type_result = _run([blkid, "-p", "-s", "TYPE", "-o", "value", device_path])
-    uuid_result = _run([blkid, "-p", "-s", "UUID", "-o", "value", device_path])
-    header_result = _run([dumpe2fs, "-h", device_path])
+    type_result = _run([blkid, "-p", "-s", "TYPE", "-o", "value", device_path], pass_fds=pass_fds)
+    uuid_result = _run([blkid, "-p", "-s", "UUID", "-o", "value", device_path], pass_fds=pass_fds)
+    header_result = _run([dumpe2fs, "-h", device_path], pass_fds=pass_fds)
     if (
         type_result is None or type_result[0] != 0 or type_result[1].strip() != "ext4"
         or uuid_result is None or uuid_result[0] != 0
@@ -338,7 +342,10 @@ def perform_ext4_action(
             return Ext4FilesystemActionResponse(success=False, action=action, device_path=target.device_path, target_size_bytes=target_size_bytes, user_confirmed=True, message="The opened block-device identity changed after confirmation; no filesystem command was run.")
         argument = f"/proc/self/fd/{descriptor}"
         if action == "shrink":
-            if _filesystem_state(argument) != (target.block_count, target.block_size_bytes, target.filesystem_uuid):
+            if _filesystem_state(
+                argument,
+                pass_fds=(descriptor,),
+            ) != (target.block_count, target.block_size_bytes, target.filesystem_uuid):
                 return Ext4FilesystemActionResponse(success=False, action=action, device_path=target.device_path, target_size_bytes=target_size_bytes, user_confirmed=True, message="The ext4 filesystem changed before its offline consistency check; no resize was run.")
             e2fsck = find_session_binary("e2fsck", _environment())
             if not e2fsck or not _check_ext4_clean(e2fsck, argument, descriptor):
@@ -365,7 +372,7 @@ def perform_ext4_action(
         result = _run_mutation(command, descriptor, timeout=timeout)
         if not result:
             return Ext4FilesystemActionResponse(success=False, action=action, device_path=target.device_path, target_size_bytes=target_size_bytes, user_confirmed=True, message="The ext4 command did not complete successfully; inspect the filesystem before retrying.")
-        state = _filesystem_state(argument)
+        state = _filesystem_state(argument, pass_fds=(descriptor,))
         if state is None:
             return Ext4FilesystemActionResponse(success=False, action=action, device_path=target.device_path, target_size_bytes=target_size_bytes, user_confirmed=True, message="The ext4 utility returned successfully, but the resulting filesystem could not be verified; inspect storage before retrying.")
         result_blocks, result_block_size, result_uuid = state
