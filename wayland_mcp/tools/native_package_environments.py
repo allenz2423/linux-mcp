@@ -666,8 +666,15 @@ def _run_snapshot_command(
 ) -> tuple[str | None, str | None, bool]:
     env = _environment(snapshot.home)
     if snapshot.ecosystem == "npm":
-        env["NPM_CONFIG_CACHE"] = str(snapshot.environment_path / ".npm-cache")
-        return run_bounded_command(command, env, command_label=label, timeout_seconds=timeout, max_output_bytes=MAX_COMMAND_OUTPUT_BYTES, cwd="/", kill_process_group=True)
+        with tempfile.TemporaryDirectory(prefix="linux-mcp-npm-config-") as config_directory:
+            user_config = Path(config_directory) / "user.npmrc"
+            global_config = Path(config_directory) / "global.npmrc"
+            user_config.touch(mode=0o600)
+            global_config.touch(mode=0o600)
+            env["NPM_CONFIG_USERCONFIG"] = str(user_config)
+            env["NPM_CONFIG_GLOBALCONFIG"] = str(global_config)
+            env["NPM_CONFIG_CACHE"] = str(snapshot.environment_path / ".npm-cache")
+            return run_bounded_command(command, env, command_label=label, timeout_seconds=timeout, max_output_bytes=MAX_COMMAND_OUTPUT_BYTES, cwd="/", kill_process_group=True)
     with tempfile.TemporaryDirectory(prefix="linux-mcp-cargo-") as cargo_home:
         env["CARGO_HOME"] = cargo_home
         env["CARGO_TARGET_DIR"] = str(Path(cargo_home) / "target")
