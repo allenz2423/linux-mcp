@@ -534,6 +534,52 @@ async def test_live_capability_report_keeps_portal_grants_pending_when_interface
     assert live.capabilities["input_pointer"].state == "permission_required"
 
 
+@pytest.mark.asyncio
+async def test_live_capability_report_uses_startup_grants_and_never_promises_a_tool_time_prompt(monkeypatch):
+    response = CapabilitiesResponse(
+        session=SessionInfo(
+            session_type="wayland",
+            is_wayland=True,
+            desktop_name="Hyprland",
+            compositor_backend="hyprland",
+        ),
+        capabilities={
+            "input_keyboard": PerCapabilityStatus(supported=True, available=False, state="permission_required"),
+            "input_pointer": PerCapabilityStatus(supported=True, available=False, state="permission_required"),
+            "input_touch": PerCapabilityStatus(supported=True, available=False, state="permission_required"),
+            "screenshot": PerCapabilityStatus(supported=True, available=False, state="permission_required"),
+        },
+        summary="",
+    )
+    startup = {
+        "managed": True,
+        "status": "ready",
+        "error": None,
+        "devices": 3,
+        "touch": False,
+        "absolute_pointer": False,
+        "monitor_stream": True,
+        "integrated_stream": False,
+        "touch_unsupported": True,
+    }
+
+    from wayland_mcp import portal
+
+    monkeypatch.setattr(discovery, "get_session_capabilities", lambda: response)
+    monkeypatch.setattr(portal.remote_desktop_portal, "startup_capability_state", lambda: startup)
+    monkeypatch.setattr(discovery, "get_sanitized_env", lambda: {"PATH": "/usr/bin"})
+    monkeypatch.setattr(discovery, "find_session_binary", lambda _binary, _env: "/usr/bin/gst-launch-1.0")
+
+    live = await discovery.get_session_capabilities_async()
+
+    assert live.capabilities["input_keyboard"].state == "ready"
+    assert live.capabilities["input_pointer"].state == "ready"
+    assert live.capabilities["input_touch"].state == "dependency_missing"
+    assert live.capabilities["screenshot"].state == "ready"
+    assert "startup portal flow complete" in live.summary
+    assert "portal permissions pending" not in live.summary
+
+
 def test_gnome_capabilities_do_not_invent_exact_window_input(monkeypatch, tmp_path):
     env = {
         "PATH": "/usr/bin",

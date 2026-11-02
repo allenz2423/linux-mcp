@@ -2564,6 +2564,7 @@ def get_session_capabilities() -> CapabilitiesResponse:
     )
 
     portal_ready, portal_missing_reason = _portal_prerequisites(env, session)
+    has_gstreamer = bool(find_session_binary("gst-launch-1.0", env))
     can_observe_window_ids = statuses["window_list"].available
 
     # Wayland input is never reported as usable unless this backend can issue
@@ -2573,7 +2574,7 @@ def get_session_capabilities() -> CapabilitiesResponse:
     if keyboard_supported and portal_ready:
         statuses["input_keyboard"] = PerCapabilityStatus(
             supported=True, available=False, state="permission_required",
-            reason="The XDG RemoteDesktop portal requests keyboard and pointer control together on first input use.",
+            reason="The XDG RemoteDesktop portal requests keyboard access during MCP startup; tool calls never open a portal prompt.",
             required_dependency="dbus-next, session D-Bus, and XDG RemoteDesktop portal",
             required_permission="Remote desktop keyboard and pointer grant",
         )
@@ -2604,10 +2605,10 @@ def get_session_capabilities() -> CapabilitiesResponse:
         statuses["input_pointer"] = PerCapabilityStatus(
             supported=True, available=False, state="permission_required",
             reason=(
-                "Niri pointer control uses absolute coordinates through a user-selected monitor ScreenCast stream; "
+                "Niri pointer control uses absolute coordinates through the startup monitor ScreenCast stream; "
                 "the stream bounds must match current compositor output geometry."
                 if niri_absolute else
-                "Keyboard and pointer control share one XDG RemoteDesktop grant requested on first input use."
+                "XDG RemoteDesktop pointer access is requested during MCP startup; tool calls never open a portal prompt."
             ),
             required_dependency=(
                 "dbus-next, session D-Bus, XDG RemoteDesktop and ScreenCast portals, and compositor output geometry"
@@ -2637,7 +2638,7 @@ def get_session_capabilities() -> CapabilitiesResponse:
         statuses["input_touch"] = PerCapabilityStatus(
             supported=True, available=False, state="permission_required",
             reason=(
-                "Touch input needs an XDG RemoteDesktop touchscreen grant and a user-selected monitor ScreenCast stream; "
+                "Touch input needs an XDG RemoteDesktop touchscreen grant and the startup monitor stream in the same session; "
                 "stream bounds must match one current compositor output before input is sent."
             ),
             required_dependency="dbus-next, session D-Bus, XDG RemoteDesktop and ScreenCast portals, and compositor output geometry",
@@ -2658,22 +2659,28 @@ def get_session_capabilities() -> CapabilitiesResponse:
     if statuses["screenshot"].available and backend.name == "niri":
         statuses["screenshot"] = PerCapabilityStatus(
             supported=True, available=True, state="partial",
-            reason="Desktop and portal active-window capture are available; exact Niri crops work for visible tiles when IPC reports integral positions and bounds.",
+            reason="Desktop native capture is available; startup ScreenCast fallback can provide exact Niri crops when IPC reports integral positions and bounds.",
             required_dependency="grim",
         )
     elif not statuses["screenshot"].available:
-        if portal_ready:
+        if portal_ready and has_gstreamer:
             statuses["screenshot"] = PerCapabilityStatus(
                 supported=True, available=False, state="permission_required",
-                reason="The XDG Screenshot portal may request user confirmation; arbitrary window-ID capture is unavailable through this fallback.",
-                required_dependency="dbus-next and XDG Screenshot portal",
-                required_permission="Screenshot request grant",
+                reason="When native screenshot capture is unavailable, the startup ScreenCast stream provides desktop or verified-window fallback; tool calls never open a portal prompt.",
+                required_dependency="dbus-next, GStreamer, XDG RemoteDesktop/ScreenCast portals, and a Wayland session D-Bus",
+                required_permission="Monitor ScreenCast access requested during MCP startup",
+            )
+        elif portal_ready:
+            statuses["screenshot"] = PerCapabilityStatus(
+                supported=True, available=False, state="dependency_missing",
+                reason="Native screenshot capture is unavailable and GStreamer is required to read the startup ScreenCast fallback.",
+                required_dependency="GStreamer and native compositor screenshot support",
             )
         else:
             statuses["screenshot"] = PerCapabilityStatus(
                 supported=True, available=False, state="dependency_missing",
                 reason=portal_missing_reason,
-                required_dependency="XDG Screenshot portal, dbus-next, and a Wayland session D-Bus",
+                required_dependency="GStreamer, XDG RemoteDesktop/ScreenCast portals, dbus-next, and a Wayland session D-Bus",
             )
     busctl = find_session_binary("busctl", env)
     runtime_dir = Path(env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
@@ -2702,11 +2709,145 @@ async def get_session_capabilities_async() -> CapabilitiesResponse:
     keyboard = response.capabilities["input_keyboard"]
     pointer = response.capabilities["input_pointer"]
     touch = response.capabilities["input_touch"]
-    pending = [status for status in (keyboard, pointer, touch) if status.state == "permission_required"]
+    screenshot = response.capabilities.get("screenshot")
+    portal_statuses = (keyboard, pointer, touch, screenshot)
+    pending = [
+        status for status in portal_statuses if status is not None
+        if status.state == "permission_required"
+    ]
     if not pending:
         return response
 
     from wayland_mcp.portal import remote_desktop_portal
+
+    startup = remote_desktop_portal.startup_capability_state()
+    if startup["managed"]:
+        startup_env = get_sanitized_env()
+        startup_has_gstreamer = bool(find_session_binary("gst-launch-1.0", startup_env))
+
+        def set_state(status, *, available: bool, state: str, reason: str, dependency: str | None = None) -> None:
+            if not status.supported:
+                return
+            status.available = available
+            status.state = state
+            status.reason = None if available else reason
+            status.required_dependency = dependency if not available else None
+            status.required_permission = None
+
+        startup_error = str(startup["error"] or "").casefold()
+        setup_unavailable = any(
+            marker in startup_error
+            for marker in ("unavailable", "does not expose", "missing", "not installed")
+        )
+        failed_state = "dependency_missing" if setup_unavailable else "permission_denied"
+        if startup["status"] == "pending":
+            devices = int(startup["devices"] or 0)
+            set_state(
+                keyboard,
+                available=bool(devices & 1),
+                state="ready" if devices & 1 else "permission_required",
+                reason="The MCP server's startup portal flow is still waiting for the keyboard decision. Tool calls will not open a separate prompt.",
+            )
+            niri_absolute = response.session.compositor_backend == "niri"
+            pointer_ready = bool(startup["absolute_pointer"] if niri_absolute else devices & 2)
+            set_state(
+                pointer,
+                available=pointer_ready,
+                state="ready" if pointer_ready else "permission_required",
+                reason="The MCP server's startup portal flow is still waiting for pointer access. Tool calls will not open a separate prompt.",
+            )
+            touch_ready = bool(startup["touch"] and startup["integrated_stream"])
+            touch_state = "dependency_missing" if startup["touch_unsupported"] else (
+                "ready" if touch_ready else "permission_required"
+            )
+            set_state(
+                touch,
+                available=touch_ready,
+                state=touch_state,
+                reason=(
+                    "This portal backend does not support touchscreen control in its RemoteDesktop session."
+                    if startup["touch_unsupported"] else
+                    "The MCP server's startup portal flow is still waiting for touchscreen access. Tool calls will not open a separate prompt."
+                ),
+                dependency="XDG RemoteDesktop touchscreen support" if startup["touch_unsupported"] else None,
+            )
+            if screenshot is not None and screenshot.supported and not screenshot.available and startup_has_gstreamer:
+                set_state(
+                    screenshot,
+                    available=False,
+                    state="permission_required",
+                    reason="The startup ScreenCast decision is still pending. Tool calls will not open a separate screenshot prompt.",
+                )
+        else:
+            devices = int(startup["devices"] or 0)
+            no_grant_reason = "This permission was not granted during MCP startup. Restart the MCP server to try again; tool calls will not open a portal prompt."
+            set_state(
+                keyboard,
+                available=bool(devices & 1),
+                state="ready" if devices & 1 else failed_state,
+                reason=no_grant_reason if not devices & 1 else "",
+                dependency="XDG RemoteDesktop portal and session D-Bus" if setup_unavailable else None,
+            )
+            niri_absolute = response.session.compositor_backend == "niri"
+            pointer_ready = bool(startup["absolute_pointer"] if niri_absolute else devices & 2)
+            pointer_reason = (
+                "The portal did not provide an integrated RemoteDesktop/ScreenCast stream for absolute Niri pointer input."
+                if niri_absolute and devices & 2 and not pointer_ready else no_grant_reason
+            )
+            set_state(
+                pointer,
+                available=pointer_ready,
+                state="ready" if pointer_ready else ("dependency_missing" if niri_absolute and devices & 2 else failed_state),
+                reason=pointer_reason if not pointer_ready else "",
+                dependency="XDG RemoteDesktop and ScreenCast portal integration" if niri_absolute and devices & 2 and not pointer_ready else None,
+            )
+            touch_ready = bool(startup["touch"] and startup["integrated_stream"])
+            touch_reason = (
+                "The portal did not provide touchscreen access in the startup RemoteDesktop session with its monitor stream. Restart the MCP server to try again."
+                if devices & 4 and not touch_ready else no_grant_reason
+            )
+            set_state(
+                touch,
+                available=touch_ready,
+                state=(
+                    "ready" if touch_ready else
+                    "dependency_missing" if startup["touch_unsupported"] or (devices & 4) else
+                    failed_state
+                ),
+                reason=(
+                    "This portal backend does not support touchscreen control in its RemoteDesktop session."
+                    if startup["touch_unsupported"] else touch_reason if not touch_ready else ""
+                ),
+                dependency=(
+                    "XDG RemoteDesktop touchscreen support"
+                    if startup["touch_unsupported"] else
+                    "XDG RemoteDesktop touchscreen and ScreenCast integration"
+                    if devices & 4 and not touch_ready else None
+                ),
+            )
+
+            screen_stream_ready = bool(startup["monitor_stream"] and startup_has_gstreamer)
+            if screenshot is not None and screenshot.supported and not screenshot.available:
+                set_state(
+                    screenshot,
+                    available=screen_stream_ready,
+                    state="ready" if screen_stream_ready else ("dependency_missing" if not startup_has_gstreamer else failed_state),
+                    reason=(
+                        no_grant_reason
+                        if startup_has_gstreamer else
+                        "GStreamer is unavailable for the startup ScreenCast fallback."
+                    ),
+                    dependency="GStreamer and startup ScreenCast access" if not screen_stream_ready else None,
+                )
+
+        ready_count = sum(status.available for status in response.capabilities.values())
+        portal_label = "waiting for startup portal decisions" if startup["status"] == "pending" else "startup portal flow complete"
+        response.summary = (
+            f"Linux: yes; compositor: {response.session.compositor_backend}; "
+            f"session: {response.session.session_type}; Wayland: yes; "
+            f"ready: {ready_count}/{len(response.capabilities)}; {portal_label}."
+        )
+        return response
 
     try:
         interfaces = await remote_desktop_portal.portal_interfaces()
@@ -2728,8 +2869,11 @@ async def get_session_capabilities_async() -> CapabilitiesResponse:
             status.required_dependency = "XDG RemoteDesktop portal backend"
             status.required_permission = None
     elif "org.freedesktop.portal.ScreenCast" not in interfaces:
-        for status in (touch, pointer):
+        for status in (touch, pointer, screenshot):
+            if status is None:
+                continue
             needs_monitor_stream = status is touch or response.session.compositor_backend == "niri"
+            needs_monitor_stream = needs_monitor_stream or status is screenshot
             if needs_monitor_stream and status.state == "permission_required":
                 status.state = "dependency_missing"
                 status.reason = "The session portal does not expose org.freedesktop.portal.ScreenCast for monitor coordinate mapping."

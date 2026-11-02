@@ -11,7 +11,9 @@ from dataclasses import dataclass, replace
 import math
 import os
 import secrets
+import shutil
 import stat
+import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -23,7 +25,7 @@ from dbus_next.errors import DBusError, InterfaceNotFoundError, InvalidAddressEr
 from dbus_next.introspection import Node
 from dbus_next.validators import is_member_name_valid
 
-from wayland_mcp.session import get_sanitized_env
+from wayland_mcp.session import get_sanitized_env, logger
 
 PORTAL_NAME = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
@@ -35,6 +37,10 @@ class PortalError(RuntimeError):
     """A portal method failed, timed out, or was denied by the user."""
 
 
+class _PortalScreenCastSetupError(PortalError):
+    """ScreenCast could not be joined to an otherwise valid RemoteDesktop session."""
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteMonitorInputSession:
     path: str
@@ -44,6 +50,57 @@ class RemoteMonitorInputSession:
     position: tuple[int, int]
     size: tuple[int, int]
     newly_authorized: bool
+    pipewire_serial: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StartupScreenCastSession:
+    path: str
+    stream_id: int
+    position: tuple[int, int]
+    size: tuple[int, int]
+    pipewire_serial: int | None = None
+
+
+def _single_monitor_stream(started: dict[str, Any]) -> tuple[int, tuple[int, int], tuple[int, int], int | None] | None:
+    streams = started.get("streams")
+    if not isinstance(streams, (list, tuple)) or len(streams) != 1:
+        return None
+    stream = streams[0]
+    if not isinstance(stream, (list, tuple)) or len(stream) != 2:
+        return None
+    stream_id, properties = stream
+    if (
+        not isinstance(stream_id, int) or isinstance(stream_id, bool)
+        or not 0 <= stream_id <= 0xFFFFFFFF
+        or not isinstance(properties, dict)
+    ):
+        return None
+    source_type = properties.get("source_type")
+    if source_type is not None and (
+        not isinstance(source_type, int) or isinstance(source_type, bool) or source_type != 1
+    ):
+        return None
+
+    def pair(value: Any) -> tuple[int, int] | None:
+        if (
+            not isinstance(value, (list, tuple)) or len(value) != 2
+            or any(not isinstance(part, int) or isinstance(part, bool) for part in value)
+        ):
+            return None
+        return int(value[0]), int(value[1])
+
+    position = pair(properties.get("position"))
+    size = pair(properties.get("logical_size", properties.get("size")))
+    if (
+        position is None or size is None or min(size) <= 0
+        or max(size) > 32768 or any(abs(value) > 131072 for value in position)
+    ):
+        return None
+    pipewire_serial = properties.get("pipewire-serial")
+    if not isinstance(pipewire_serial, int) or isinstance(pipewire_serial, bool) or pipewire_serial < 0:
+        pipewire_serial = None
+    return stream_id, position, size, pipewire_serial
 
 
 def _parse_portal_introspection(xml: str) -> Node:
@@ -265,6 +322,326 @@ class RemoteDesktopPortal(_PortalBus):
         self._pointer_session: tuple[str, Any, int] | None = None
         self._touch_session: RemoteMonitorInputSession | None = None
         self._absolute_pointer_session: RemoteMonitorInputSession | None = None
+        self._startup_monitor_session: RemoteMonitorInputSession | StartupScreenCastSession | None = None
+        self._screen_cast_interface: Any | None = None
+        self._startup_only = False
+        self._startup_status = "not_started"
+        self._startup_error: str | None = None
+        self._startup_task: asyncio.Task | None = None
+        self._startup_touch_unsupported = False
+
+    def startup_capability_state(self) -> dict[str, Any]:
+        """Return the process-local startup portal grants for capability reporting."""
+        input_session = self._keyboard_session or self._pointer_session
+        monitor_session = self._startup_monitor_session
+        return {
+            "managed": self._startup_only,
+            "status": self._startup_status,
+            "error": self._startup_error,
+            "devices": int(input_session[2]) if input_session else 0,
+            "touch": self._touch_session is not None,
+            "absolute_pointer": self._absolute_pointer_session is not None,
+            "monitor_stream": monitor_session is not None,
+            "integrated_stream": bool(
+                input_session is not None and monitor_session is not None
+                and input_session[0] == monitor_session.path
+            ),
+            "touch_unsupported": self._startup_touch_unsupported,
+        }
+
+    def start_startup_permission_request(self) -> asyncio.Task | None:
+        """Begin the Wayland permission flow as the server starts.
+
+        Stdio clients can connect while the desktop consent dialog is open.
+        In startup-only mode, action tools wait for this one request and never
+        open another portal prompt later in the session.
+        """
+        if self._startup_status != "not_started":
+            return self._startup_task
+        self._startup_only = True
+        env = get_sanitized_env()
+        if not env.get("WAYLAND_DISPLAY"):
+            self._startup_status = "ready"
+            return None
+        self._startup_status = "pending"
+        self._startup_task = asyncio.create_task(self._prepare_startup_permissions())
+        return self._startup_task
+
+    async def _prepare_startup_permissions(self) -> None:
+        try:
+            await self._create_startup_session()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._startup_error = str(exc)[:240] or type(exc).__name__
+            logger.warning("Wayland portal permissions were unavailable at MCP startup: %s", self._startup_error)
+        finally:
+            self._startup_status = "ready"
+            self._startup_task = None
+
+    async def _wait_for_startup_permission_request(self) -> None:
+        if not self._startup_only or asyncio.current_task() is self._startup_task:
+            return
+        if self._startup_status == "pending" and self._startup_task is not None:
+            await asyncio.shield(self._startup_task)
+        if self._startup_error:
+            raise PortalError(
+                "Wayland portal permissions were not granted during MCP startup. Restart the MCP server to try again."
+            )
+
+    async def _create_startup_session(self) -> None:
+        """Request every supported desktop input and screen permission at startup."""
+        async with self._session_lock:
+            if self.bus is not None and not self.bus.connected:
+                self._keyboard_session = None
+                self._pointer_session = None
+                self._touch_session = None
+                self._absolute_pointer_session = None
+                self._startup_monitor_session = None
+                self._screen_cast_interface = None
+
+            remote = await self.proxy("org.freedesktop.portal.RemoteDesktop")
+            try:
+                screencast = await self.proxy("org.freedesktop.portal.ScreenCast")
+            except InterfaceNotFoundError:
+                # Keyboard and relative pointer control still work without a
+                # ScreenCast interface; touch and screenshot fallback do not.
+                screencast = None
+            screen_cast_portal = screencast
+            use_separate_screencast = False
+
+            async def create_session(device_types: int, *, include_screencast: bool = True):
+                token = secrets.token_hex(12)
+                create_request = await remote.call_create_session({
+                    "handle_token": Variant("s", "rd_startup_" + token),
+                    "session_handle_token": Variant("s", "session_startup_" + token),
+                })
+                created = await self.wait_response(create_request)
+                session = created.get("session_handle")
+                if not isinstance(session, str) or not session.startswith("/"):
+                    raise PortalError("The remote-desktop portal returned an invalid startup session handle.")
+
+                selected_screencast = screencast if include_screencast else None
+                try:
+                    select_devices = await remote.call_select_devices(session, {
+                        "handle_token": Variant("s", "dev_startup_" + token),
+                        "types": Variant("u", device_types),
+                        "persist_mode": Variant("u", 1),
+                    })
+                    await self.wait_response(select_devices)
+                    if selected_screencast is not None:
+                        try:
+                            select_sources = await selected_screencast.call_select_sources(session, {
+                                "handle_token": Variant("s", "source_startup_" + token),
+                                "types": Variant("u", 1),
+                                "multiple": Variant("b", False),
+                            })
+                            await self.wait_response(select_sources)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            raise _PortalScreenCastSetupError(
+                                "The startup ScreenCast session could not be selected."
+                            ) from exc
+
+                    start_request = await remote.call_start(session, "", {
+                        "handle_token": Variant("s", "start_startup_" + token),
+                    })
+                    started = await self.wait_response(start_request)
+                except BaseException:
+                    await self._close_session_path(session)
+                    raise
+                return session, started, selected_screencast
+
+            try:
+                session, started, screencast = await create_session(7)
+            except _PortalScreenCastSetupError as exc:
+                logger.info("The portal cannot combine ScreenCast with startup RemoteDesktop: %s", str(exc))
+                use_separate_screencast = True
+                try:
+                    session, started, screencast = await create_session(7, include_screencast=False)
+                except PortalError as input_error:
+                    if "unsupported device type" not in str(input_error).casefold():
+                        raise
+                    self._startup_touch_unsupported = True
+                    logger.info("The portal does not support startup touchscreen permission; retrying keyboard and pointer only.")
+                    session, started, screencast = await create_session(3, include_screencast=False)
+            except PortalError as exc:
+                if "unsupported device type" not in str(exc).casefold():
+                    raise
+                self._startup_touch_unsupported = True
+                # Some portal backends do not implement the touchscreen bit.
+                # Retry with all supported features while staying inside the
+                # startup flow; tool calls never retry permission requests.
+                logger.info("The portal does not support startup touchscreen permission; retrying keyboard and pointer only.")
+                try:
+                    session, started, screencast = await create_session(3)
+                except _PortalScreenCastSetupError as screen_error:
+                    logger.info("The portal cannot combine ScreenCast with startup RemoteDesktop: %s", str(screen_error))
+                    use_separate_screencast = True
+                    session, started, screencast = await create_session(3, include_screencast=False)
+
+            granted_devices = int(started.get("devices", 0) or 0)
+            if not granted_devices & 7:
+                await self._close_session_path(session)
+                raise PortalError("The user did not grant any requested desktop input permissions.")
+
+            shared_session = (session, remote, granted_devices)
+            self._keyboard_session = shared_session
+            self._pointer_session = shared_session
+            self._screen_cast_interface = screencast
+
+            stream_data = _single_monitor_stream(started)
+            if screencast is None or stream_data is None:
+                if screen_cast_portal is not None and (use_separate_screencast or screencast is not None):
+                    standalone_stream = await self._create_startup_screencast_session(screen_cast_portal)
+                    if standalone_stream is not None:
+                        self._startup_monitor_session = standalone_stream
+                        self._screen_cast_interface = screen_cast_portal
+                return
+
+            stream_id, position, size, pipewire_serial = stream_data
+            monitor_session = RemoteMonitorInputSession(
+                path=session,
+                remote=remote,
+                granted_devices=granted_devices,
+                stream_id=stream_id,
+                position=position,
+                size=size,
+                newly_authorized=False,
+                pipewire_serial=pipewire_serial,
+            )
+            self._startup_monitor_session = monitor_session
+            if granted_devices & 4:
+                self._touch_session = monitor_session
+            try:
+                methods = await self.portal_methods("org.freedesktop.portal.RemoteDesktop")
+            except Exception as exc:
+                logger.info("Could not inspect startup RemoteDesktop methods: %s", type(exc).__name__)
+                methods = set()
+            if granted_devices & 2 and "NotifyPointerMotionAbsolute" in methods:
+                self._absolute_pointer_session = monitor_session
+
+    async def _create_startup_screencast_session(self, screencast: Any) -> StartupScreenCastSession | None:
+        """Request a startup-only screenshot stream when combined sessions are unsupported."""
+        token = secrets.token_hex(12)
+        session: str | None = None
+        try:
+            create_request = await screencast.call_create_session({
+                "handle_token": Variant("s", "sc_startup_" + token),
+                "session_handle_token": Variant("s", "sc_session_startup_" + token),
+            })
+            created = await self.wait_response(create_request)
+            session_value = created.get("session_handle")
+            if not isinstance(session_value, str) or not session_value.startswith("/"):
+                raise PortalError("The ScreenCast portal returned an invalid startup session handle.")
+            session = session_value
+            select_sources = await screencast.call_select_sources(session, {
+                "handle_token": Variant("s", "sc_sources_startup_" + token),
+                "types": Variant("u", 1),
+                "multiple": Variant("b", False),
+            })
+            await self.wait_response(select_sources)
+            start_request = await screencast.call_start(session, "", {
+                "handle_token": Variant("s", "sc_start_startup_" + token),
+            })
+            started = await self.wait_response(start_request)
+        except asyncio.CancelledError:
+            if session is not None:
+                await self._close_session_path(session)
+            raise
+        except Exception as exc:
+            if session is not None:
+                await self._close_session_path(session)
+            logger.info("The standalone startup ScreenCast request was unavailable: %s", str(exc)[:240])
+            return None
+
+        stream_data = _single_monitor_stream(started)
+        if stream_data is None:
+            await self._close_session_path(session)
+            logger.info("The standalone startup ScreenCast session returned no validated monitor stream.")
+            return None
+        stream_id, position, size, pipewire_serial = stream_data
+        return StartupScreenCastSession(
+            path=session,
+            stream_id=stream_id,
+            position=position,
+            size=size,
+            pipewire_serial=pipewire_serial,
+        )
+
+    async def capture_startup_screen_frame(self) -> tuple[bytes, RemoteMonitorInputSession | StartupScreenCastSession]:
+        """Capture one frame from the ScreenCast stream approved at startup."""
+        await self._wait_for_startup_permission_request()
+        monitor_session = self._startup_monitor_session
+        screencast = self._screen_cast_interface
+        if monitor_session is None or screencast is None:
+            raise PortalError("No monitor ScreenCast permission was granted during MCP startup.")
+        gst_launch = shutil.which("gst-launch-1.0", path=get_sanitized_env().get("PATH"))
+        if not gst_launch:
+            raise PortalError("A startup ScreenCast session is active, but GStreamer is unavailable for frame capture.")
+        try:
+            fd = await screencast.call_open_pipe_wire_remote(monitor_session.path, {})
+        except Exception as exc:
+            raise PortalError("The startup ScreenCast session could not open its PipeWire stream.") from exc
+        if not isinstance(fd, int) or isinstance(fd, bool) or fd < 0:
+            raise PortalError("The startup ScreenCast session returned an invalid PipeWire descriptor.")
+
+        source = ["pipewiresrc", f"fd={fd}"]
+        if monitor_session.pipewire_serial is not None:
+            source.append(f"target-object={monitor_session.pipewire_serial}")
+        else:
+            source.append(f"path={monitor_session.stream_id}")
+        command = [
+            gst_launch, "-q", *source, "num-buffers=1", "do-timestamp=true",
+            "!", "videoconvert", "!", "pngenc", "!", "fdsink", "fd=1",
+        ]
+
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=get_sanitized_env(),
+                pass_fds=(fd,),
+                close_fds=True,
+            )
+
+            async def read_frame() -> bytes:
+                output = bytearray()
+                assert process is not None and process.stdout is not None
+                while True:
+                    chunk = await process.stdout.read(min(64 * 1024, MAX_SCREENSHOT_BYTES + 1 - len(output)))
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    if len(output) > MAX_SCREENSHOT_BYTES:
+                        raise PortalError("The startup ScreenCast frame exceeds the 32 MiB output limit.")
+                return_code = await process.wait()
+                if return_code != 0 or not output:
+                    raise PortalError("GStreamer could not read a frame from the startup ScreenCast stream.")
+                return bytes(output)
+
+            try:
+                image = await asyncio.wait_for(read_frame(), timeout=8)
+            except asyncio.TimeoutError as exc:
+                raise PortalError("Capturing a frame from the startup ScreenCast stream timed out.") from exc
+        except OSError as exc:
+            raise PortalError(f"Could not capture the startup ScreenCast stream: {exc.strerror or type(exc).__name__}.") from exc
+        finally:
+            if process is not None and process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return image, monitor_session
 
     def _on_session_closed(self, path: str) -> None:
         if self._keyboard_session and self._keyboard_session[0] == path:
@@ -275,17 +652,36 @@ class RemoteDesktopPortal(_PortalBus):
             self._touch_session = None
         if self._absolute_pointer_session and self._absolute_pointer_session.path == path:
             self._absolute_pointer_session = None
+        if self._startup_monitor_session and self._startup_monitor_session.path == path:
+            self._startup_monitor_session = None
+            self._screen_cast_interface = None
 
     async def ensure_session(self, *, pointer: bool = False) -> tuple[str, Any, int, bool]:
         """Return the shared keyboard-and-pointer input session.
 
-        The portal request selects both input devices together, so the user
-        grants the complete desktop input capability in one consent flow. The
-        session remains process-scoped. Pointer coordinates are still mapped
-        using fresh compositor cursor and output observations; no screen-capture
-        stream is requested for input. The final value reports whether this call
-        created a session and may have waited for a permission dialog.
+        The server startup flow requests its input devices together with one
+        monitor stream. Standalone callers retain the input-only request.
+        Pointer coordinates are still checked against fresh compositor
+        observations. The final value reports whether this call created a
+        session and may have waited for a permission dialog.
         """
+        if self.bus is not None and not self.bus.connected:
+            self._keyboard_session = None
+            self._pointer_session = None
+            self._touch_session = None
+            self._absolute_pointer_session = None
+            self._startup_monitor_session = None
+            self._screen_cast_interface = None
+        cached = self._pointer_session or self._keyboard_session
+        if cached is not None:
+            return (*cached, False)
+        await self._wait_for_startup_permission_request()
+        if self._startup_only:
+            cached = self._pointer_session or self._keyboard_session
+            if cached is None:
+                raise PortalError("No desktop input permission was granted at MCP startup; restart the server to retry.")
+            return (*cached, False)
+
         async with self._session_lock:
             if self.bus is not None and not self.bus.connected:
                 self._keyboard_session = None
@@ -351,6 +747,23 @@ class RemoteDesktopPortal(_PortalBus):
         """
         if session_kind not in {"touch", "absolute_pointer"} or device_type not in {2, 4}:
             raise PortalError("Unsupported monitor-mapped input session type.")
+        if self.bus is not None and not self.bus.connected:
+            self._keyboard_session = None
+            self._pointer_session = None
+            self._touch_session = None
+            self._absolute_pointer_session = None
+            self._startup_monitor_session = None
+            self._screen_cast_interface = None
+        cached = self._touch_session if session_kind == "touch" else self._absolute_pointer_session
+        if cached is not None:
+            return replace(cached, newly_authorized=False)
+        await self._wait_for_startup_permission_request()
+        if self._startup_only:
+            cached = self._touch_session if session_kind == "touch" else self._absolute_pointer_session
+            if cached is None:
+                raise PortalError("No matching touchscreen/monitor permission was granted at MCP startup; restart the server to retry.")
+            return replace(cached, newly_authorized=False)
+
         async with self._session_lock:
             if self.bus is not None and not self.bus.connected:
                 self._keyboard_session = None
@@ -542,12 +955,19 @@ class RemoteDesktopPortal(_PortalBus):
 
     async def close_touch_session(self) -> None:
         touch_session = self._touch_session
+        shared_input_session = self._keyboard_session or self._pointer_session
+        if touch_session is not None and shared_input_session is not None and touch_session.path == shared_input_session[0]:
+            # Startup combines these capabilities in one RemoteDesktop session.
+            return
         self._touch_session = None
         if touch_session is not None:
             await self._close_session_path(touch_session.path)
 
     async def close_absolute_pointer_session(self) -> None:
         pointer_session = self._absolute_pointer_session
+        shared_input_session = self._keyboard_session or self._pointer_session
+        if pointer_session is not None and shared_input_session is not None and pointer_session.path == shared_input_session[0]:
+            return
         self._absolute_pointer_session = None
         if pointer_session is not None:
             await self._close_session_path(pointer_session.path)
@@ -592,6 +1012,10 @@ class RemoteDesktopPortal(_PortalBus):
         )
 
     async def close(self) -> None:
+        startup_task = self._startup_task
+        if startup_task is not None and not startup_task.done() and startup_task is not asyncio.current_task():
+            startup_task.cancel()
+            await asyncio.gather(startup_task, return_exceptions=True)
         bus = self.bus
         sessions = [
             session for session in (
@@ -599,6 +1023,7 @@ class RemoteDesktopPortal(_PortalBus):
                 self._pointer_session[0] if self._pointer_session else None,
                 self._touch_session.path if self._touch_session else None,
                 self._absolute_pointer_session.path if self._absolute_pointer_session else None,
+                self._startup_monitor_session.path if self._startup_monitor_session else None,
             ) if session
         ]
         if bus and bus.connected:
@@ -611,8 +1036,15 @@ class RemoteDesktopPortal(_PortalBus):
         self._pointer_session = None
         self._touch_session = None
         self._absolute_pointer_session = None
+        self._startup_monitor_session = None
+        self._screen_cast_interface = None
         self._introspection_cache.clear()
         await self.close_bus()
+        self._startup_only = False
+        self._startup_status = "not_started"
+        self._startup_error = None
+        self._startup_task = None
+        self._startup_touch_unsupported = False
 
 
 remote_desktop_portal = RemoteDesktopPortal()

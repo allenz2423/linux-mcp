@@ -6,22 +6,12 @@ from typing import Optional
 
 from wayland_mcp.backends.registry import detect_backend
 from wayland_mcp.models import ScreenshotResponse, WindowGeometry
-from wayland_mcp.portal import PortalError, ScreenshotPortal
+from wayland_mcp.png import crop_png, png_dimensions
+from wayland_mcp.portal import PortalError, remote_desktop_portal
 from wayland_mcp.safety.tokens import snapshot_token_manager
 from wayland_mcp.tools.windows import _allowed_window_operations
 
 MAX_SCREENSHOT_BYTES = 32 * 1024 * 1024
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-
-
-def _png_dimensions(image: bytes) -> tuple[int, int]:
-    if len(image) < 24 or not image.startswith(PNG_SIGNATURE):
-        raise ValueError("Screenshot provider did not return a PNG image.")
-    width = int.from_bytes(image[16:20], "big")
-    height = int.from_bytes(image[20:24], "big")
-    if not (1 <= width <= 32768 and 1 <= height <= 32768):
-        raise ValueError("Screenshot dimensions are invalid.")
-    return width, height
 
 
 async def capture_screenshot(
@@ -63,34 +53,85 @@ async def capture_screenshot(
             geometry=geometry,
             message="Niri window bounds changed after observation; screenshot and snapshot token were discarded. Observe again.",
         ), b""
-    portal_used = False
-    if (not success or not image) and scope == "window" and target is not None:
-        # A user-selected portal window cannot prove it is the requested ID.
-        return ScreenshotResponse(success=False, scope=scope, target=target, geometry=geometry,
-                                  message=message or "Exact window screenshot unavailable."), b""
     if not success or not image:
-        portal = ScreenshotPortal()
         try:
-            image, width, height = await portal.capture(scope=scope)
-            geometry = WindowGeometry(x=0, y=0, width=width, height=height)
+            image, monitor_session = await remote_desktop_portal.capture_startup_screen_frame()
+            width, height = png_dimensions(image)
+            monitor_bounds = (*monitor_session.position, *monitor_session.size)
+            outputs = backend.list_outputs()
+            matching_outputs = [
+                output for output in outputs.outputs
+                if output.enabled and output.logical_geometry is not None
+                and (
+                    output.logical_geometry.x,
+                    output.logical_geometry.y,
+                    output.logical_geometry.width,
+                    output.logical_geometry.height,
+                ) == monitor_bounds
+            ] if outputs.success else []
+            if len(matching_outputs) != 1:
+                raise PortalError(
+                    "The startup ScreenCast monitor does not match exactly one current compositor output."
+                )
+
+            if scope == "desktop":
+                enabled_outputs = [
+                    output for output in outputs.outputs
+                    if output.enabled and output.logical_geometry is not None
+                ] if outputs.success else []
+                if len(enabled_outputs) != 1:
+                    raise PortalError(
+                        "The startup ScreenCast session covers one monitor; desktop-wide capture needs a native compositor screenshot."
+                    )
+                geometry = WindowGeometry(x=0, y=0, width=width, height=height)
+            else:
+                if selected_window is None or selected_window.geometry is None:
+                    raise PortalError("No exact observed window with verified geometry is available to crop from the startup ScreenCast stream.")
+                detail = backend.get_window_detail(selected_window.id)
+                if (
+                    not detail.success or detail.window is None
+                    or detail.window.id != selected_window.id
+                    or detail.window.geometry is None
+                    or detail.window.geometry.model_dump() != selected_window.geometry.model_dump()
+                ):
+                    raise PortalError("The exact window changed during startup ScreenCast capture; observe again.")
+                logical = selected_window.geometry
+                left, top, monitor_width, monitor_height = monitor_bounds
+                if (
+                    logical.x < left or logical.y < top
+                    or logical.x + logical.width > left + monitor_width
+                    or logical.y + logical.height > top + monitor_height
+                ):
+                    raise PortalError("The exact window is not fully inside the startup ScreenCast monitor.")
+                scale_x = width / monitor_width
+                scale_y = height / monitor_height
+                pixel_x = round((logical.x - left) * scale_x)
+                pixel_y = round((logical.y - top) * scale_y)
+                pixel_width = round(logical.width * scale_x)
+                pixel_height = round(logical.height * scale_y)
+                image = crop_png(image, pixel_x, pixel_y, pixel_width, pixel_height)
+                width, height = png_dimensions(image)
+                geometry = logical
             success = True
-            portal_used = True
-            message = "Screenshot captured through the XDG Screenshot portal."
+            message = "Screenshot captured from the ScreenCast permission granted at MCP startup."
         except PortalError as exc:
             return ScreenshotResponse(success=False, scope=scope, target=target,
-                                      message=f"{message or 'Compositor screenshot unavailable.'} Portal fallback: {exc}"), b""
-        finally:
-            await portal.close_bus()
+                                      geometry=geometry,
+                                      message=f"{message or 'Compositor screenshot unavailable.'} Startup ScreenCast fallback: {exc}"), b""
+        except ValueError as exc:
+            return ScreenshotResponse(success=False, scope=scope, target=target,
+                                      geometry=geometry,
+                                      message=f"Startup ScreenCast image validation failed: {exc}"), b""
     if len(image) > MAX_SCREENSHOT_BYTES:
         return ScreenshotResponse(success=False, scope=scope, target=target,
                                   message="Screenshot exceeds the 32 MiB output limit."), b""
     try:
-        width, height = _png_dimensions(image)
+        width, height = png_dimensions(image)
     except ValueError as exc:
         return ScreenshotResponse(success=False, scope=scope, target=target, message=str(exc)), b""
 
-    observed_windows = [selected_window] if selected_window is not None and not portal_used else []
-    allowed = set() if portal_used or scope == "desktop" else _allowed_window_operations(backend)
+    observed_windows = [selected_window] if selected_window is not None and scope == "window" else []
+    allowed = set() if scope == "desktop" else _allowed_window_operations(backend)
     token = snapshot_token_manager.create_token(
         scope="screenshot_window" if scope == "window" else "screenshot_desktop",
         allowed_operations=allowed,
@@ -100,7 +141,7 @@ async def capture_screenshot(
     response = ScreenshotResponse(
         success=True,
         scope=scope,
-        target=selected_window.id if selected_window is not None and not portal_used else None,
+        target=selected_window.id if selected_window is not None else None,
         geometry=geometry or WindowGeometry(x=0, y=0, width=width, height=height),
         mime_type="image/png",
         # The MCP server attaches an image content block. Do not duplicate a
