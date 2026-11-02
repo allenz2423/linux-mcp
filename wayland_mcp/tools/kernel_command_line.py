@@ -110,6 +110,15 @@ def _identity(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _same_directory_identity(actual: tuple[int, ...], expected: tuple[int, ...]) -> bool:
+    """Compare directory identity without child-entry size and timestamp changes."""
+    # GRUB generation stages its output in the target directory. Creating that
+    # reserved file updates directory size and timestamps, so those fields are
+    # not stable across the action. Device/inode/type/link-count/owner remain
+    # bound to the directory that was confirmed.
+    return actual[:6] == expected[:6]
+
+
 def _safe_system_binary(name: str, env: dict[str, str]) -> tuple[str | None, tuple[int, ...] | None]:
     if not sys.platform.startswith("linux"):
         return None, None
@@ -1185,7 +1194,11 @@ def _prepare_generated_output(
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
         directory_identity = _safe_rooted_directory(snapshot.output_path.parent, "GRUB configuration directory")
-        if directory_identity != snapshot.output_parent_identity or _identity(os.fstat(directory_fd)) != snapshot.output_parent_identity:
+        if (
+            directory_identity is None
+            or not _same_directory_identity(directory_identity, snapshot.output_parent_identity)
+            or not _same_directory_identity(_identity(os.fstat(directory_fd)), snapshot.output_parent_identity)
+        ):
             return None, "The GRUB configuration directory changed after confirmation."
         flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         descriptor = os.open(temp_name, flags, dir_fd=directory_fd)
@@ -1249,7 +1262,11 @@ def _publish_grub_output(
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
         directory_identity = _safe_rooted_directory(snapshot.output_path.parent, "GRUB configuration directory")
-        if directory_identity != snapshot.output_parent_identity or _identity(os.fstat(directory_fd)) != snapshot.output_parent_identity:
+        if (
+            directory_identity is None
+            or not _same_directory_identity(directory_identity, snapshot.output_parent_identity)
+            or not _same_directory_identity(_identity(os.fstat(directory_fd)), snapshot.output_parent_identity)
+        ):
             return False, None
         old_bytes, old_identity, old_xattrs, error = _read_rooted_file(
             snapshot.output_path, "generated GRUB configuration", GRUB_OUTPUT_LIMIT
