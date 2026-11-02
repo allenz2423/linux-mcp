@@ -124,6 +124,7 @@ def _read_remote_table(
         endpoint,
         arguments,
         readonly=True,
+        quiet=False,
         timeout_seconds=REMOTE_COMMAND_TIMEOUT_SECONDS,
         max_output_bytes=MAX_VIRSH_OUTPUT_BYTES,
         command_label=command_label,

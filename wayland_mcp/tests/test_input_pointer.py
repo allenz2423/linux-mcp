@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from wayland_mcp.models import (
     FocusedWindowResponse,
+    KeyboardActionResult,
     OutputInfo,
     OutputListResponse,
     WindowGeometry,
@@ -104,6 +107,14 @@ class _Portal:
 
     async def keyboard_keysym(self, keysym: int, pressed: bool):
         self.keysyms.append((keysym, pressed))
+
+
+class _TouchPortal:
+    async def ensure_touch_session(self):
+        return SimpleNamespace(newly_authorized=True)
+
+    async def ensure_absolute_pointer_session(self):
+        return SimpleNamespace(newly_authorized=True)
 
 
 def _token(manager: TokenManager, backend: _Backend, operation: str = "pointer_action") -> str:
@@ -212,3 +223,94 @@ async def test_new_keyboard_permission_requires_fresh_screenshot_before_keypress
     assert not result.success
     assert "fresh screenshot" in result.message
     assert portal.keysyms == []
+
+
+@pytest.mark.asyncio
+async def test_x11_pointer_action_accepts_snapshot_geometry_mapping(monkeypatch):
+    backend = _Backend()
+    backend.name = "x11"
+    manager = TokenManager()
+    captured = {}
+    monkeypatch.setattr(desktop_input, "detect_backend", lambda: backend)
+    monkeypatch.setattr(desktop_input, "snapshot_token_manager", manager)
+
+    async def move(_backend, _target, geometry, _x, _y):
+        captured["geometry"] = geometry
+        return None
+
+    async def command(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(desktop_input, "_x11_move_to_window_point", move)
+    monkeypatch.setattr(desktop_input, "_focused_window_matches", lambda *_args: True)
+    monkeypatch.setattr(desktop_input, "_x11_pointer_matches", lambda *_args: True)
+    monkeypatch.setattr(desktop_input, "_run_x11_command", command)
+
+    result = await desktop_input.pointer_action(
+        "window-1", _token(manager, backend), "click", x=200, y=100,
+    )
+
+    assert result.success
+    assert captured["geometry"] == {"x": 10, "y": 20, "width": 500, "height": 300}
+
+
+@pytest.mark.asyncio
+async def test_niri_absolute_pointer_accepts_snapshot_geometry_mapping(monkeypatch):
+    backend = _Backend()
+    backend.name = "niri"
+    backend.get_pointer_position = lambda: None
+    manager = TokenManager()
+    monkeypatch.setattr(desktop_input, "detect_backend", lambda: backend)
+    monkeypatch.setattr(desktop_input, "remote_desktop_portal", _TouchPortal())
+    monkeypatch.setattr(desktop_input, "snapshot_token_manager", manager)
+
+    result = await desktop_input.pointer_action(
+        "window-1", _token(manager, backend), "click", x=200, y=100,
+    )
+
+    assert not result.success
+    assert "permission was just granted" in result.message
+
+
+@pytest.mark.asyncio
+async def test_x11_keyboard_action_accepts_snapshot_geometry_mapping(monkeypatch):
+    backend = _Backend()
+    backend.name = "x11"
+    manager = TokenManager()
+    captured = {}
+    monkeypatch.setattr(desktop_input, "detect_backend", lambda: backend)
+    monkeypatch.setattr(desktop_input, "snapshot_token_manager", manager)
+
+    async def send(_backend, _target, geometry, *, text=None, key=None):
+        captured["geometry"] = geometry
+        return KeyboardActionResult(
+            success=True,
+            text_length=len(text or ""),
+            key_pressed=key,
+            message="accepted",
+        )
+
+    monkeypatch.setattr(desktop_input, "_x11_keyboard_action", send)
+
+    result = await desktop_input.keyboard_action(
+        "window-1", _token(manager, backend, "keyboard_action"), "type_text", text="test",
+    )
+
+    assert result.success
+    assert captured["geometry"] == {"x": 10, "y": 20, "width": 500, "height": 300}
+
+
+@pytest.mark.asyncio
+async def test_touch_action_accepts_snapshot_geometry_mapping(monkeypatch):
+    backend = _Backend()
+    manager = TokenManager()
+    monkeypatch.setattr(desktop_input, "detect_backend", lambda: backend)
+    monkeypatch.setattr(desktop_input, "remote_desktop_portal", _TouchPortal())
+    monkeypatch.setattr(desktop_input, "snapshot_token_manager", manager)
+
+    result = await desktop_input.touch_action(
+        "window-1", _token(manager, backend, "touch_action"), "tap", x=200, y=100,
+    )
+
+    assert not result.success
+    assert "permission was just granted" in result.message

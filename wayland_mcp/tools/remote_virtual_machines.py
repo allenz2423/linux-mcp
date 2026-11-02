@@ -163,6 +163,7 @@ def _run_remote_virsh(
     arguments: list[str],
     *,
     readonly: bool,
+    quiet: bool = True,
     timeout_seconds: int,
     max_output_bytes: int,
     command_label: str,
@@ -195,13 +196,10 @@ def _run_remote_virsh(
                 + "?no_tty=1&command="
                 + quote(str(wrapper), safe="/")
             )
-            command = [
-                virsh,
-                "--quiet",
-                "--no-pkttyagent",
-                "--connect",
-                connection_uri,
-            ]
+            command = [virsh]
+            if quiet:
+                command.append("--quiet")
+            command.extend(("--no-pkttyagent", "--connect", connection_uri))
             if readonly:
                 command.append("--readonly")
             command.extend(arguments)

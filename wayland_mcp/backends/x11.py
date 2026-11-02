@@ -215,19 +215,20 @@ class X11Backend(BaseCompositorBackend):
         workspaces, _workspace_error = self._workspace_rows()
         names = {workspace.id: workspace.name for workspace in workspaces}
         active_id = self._active_window_id()
-        windows = [
-            WindowInfo(
+        active_numeric_id = int(active_id, 16) if active_id is not None else None
+        windows = []
+        for window_id, desktop, geometry, title in rows:
+            is_focused = active_numeric_id is not None and int(window_id, 16) == active_numeric_id
+            windows.append(WindowInfo(
                 id=window_id,
                 app_id="Unknown",
                 title=title,
                 workspace_id=desktop or None,
                 workspace_name=names.get(desktop),
-                is_focused=window_id == active_id,
+                is_focused=is_focused,
                 geometry=geometry,
-                state=WindowState(is_focused=window_id == active_id),
-            )
-            for window_id, desktop, geometry, title in rows
-        ]
+                state=WindowState(is_focused=is_focused),
+            ))
         focused = next((window for window in windows if window.is_focused), None)
         message = f"Discovered {len(windows)} X11 window(s) across {len(workspaces)} desktop(s)."
         if not self.xprop:

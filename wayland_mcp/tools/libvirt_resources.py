@@ -197,7 +197,6 @@ def _read_table(
 ) -> tuple[list[dict[str, str]] | None, str | None, bool]:
     command = [
         binary,
-        "--quiet",
         "--no-pkttyagent",
         "--connect",
         SCOPED_URIS[scope],

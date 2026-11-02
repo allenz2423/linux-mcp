@@ -181,7 +181,7 @@ async def _x11_pointer_action(
     start_x: int | None,
     start_y: int | None,
 ) -> PointerActionResult:
-    observed_geometry = geometry.model_dump()
+    observed_geometry = dict(geometry)
     move_x = start_x if action == "drag" else x
     move_y = start_y if action == "drag" else y
     error = await _x11_move_to_window_point(
@@ -333,7 +333,7 @@ async def touch_action(
         return TouchActionResult(success=False, message=f"Touch action rejected: {error}")
     if observed.geometry is None:
         return TouchActionResult(success=False, message="This observation has no verified window geometry.")
-    geometry = observed.geometry.model_dump()
+    geometry = dict(observed.geometry)
     if geometry["width"] <= 0 or geometry["height"] <= 0:
         return TouchActionResult(success=False, message="The observed window geometry is empty or invalid.")
     if action not in {"tap", "double_tap", "long_press", "swipe"}:
@@ -498,7 +498,7 @@ async def _niri_absolute_pointer_action(
     start_y: int | None,
 ) -> PointerActionResult:
     actions_performed = 0
-    observed_geometry = geometry.model_dump()
+    observed_geometry = dict(geometry)
     try:
         monitor_session = await remote_desktop_portal.ensure_absolute_pointer_session()
         if monitor_session.newly_authorized:
@@ -1059,7 +1059,7 @@ async def keyboard_action(
     if backend.name == "x11":
         if observed.geometry is None:
             return KeyboardActionResult(success=False, message="This observation has no verified X11 window geometry.")
-        geometry = observed.geometry.model_dump()
+        geometry = dict(observed.geometry)
         if action == "type_text":
             if not isinstance(text, str) or len(text) > MAX_TYPED_CHARACTERS:
                 return KeyboardActionResult(success=False, message=f"Text must be at most {MAX_TYPED_CHARACTERS} characters.")

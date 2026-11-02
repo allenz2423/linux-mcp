@@ -18,7 +18,7 @@ DESKTOPS = (
 )
 
 
-def _backend(monkeypatch, *, output=WINDOWS) -> X11Backend:
+def _backend(monkeypatch, *, output=WINDOWS, active_id="0x01200001") -> X11Backend:
     monkeypatch.setattr(
         x11,
         "find_session_binary",
@@ -27,7 +27,7 @@ def _backend(monkeypatch, *, output=WINDOWS) -> X11Backend:
 
     def run(arguments, **_kwargs):
         if arguments[0].endswith("xprop"):
-            return SimpleNamespace(returncode=0, stdout="_NET_ACTIVE_WINDOW(WINDOW): window id # 0x01200001\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout=f"_NET_ACTIVE_WINDOW(WINDOW): window id # {active_id}\n", stderr="")
         if arguments[0].endswith("wmctrl"):
             if arguments[1:] == ["-d"]:
                 return SimpleNamespace(returncode=0, stdout=DESKTOPS, stderr="")
@@ -56,6 +56,19 @@ def test_x11_lists_exact_windows_and_desktops(monkeypatch):
     assert desktops.success
     assert [item.name for item in desktops.workspaces] == ["Workspace A", "Workspace B"]
     assert desktops.active_workspace is not None and desktops.active_workspace.id == "0"
+
+
+def test_x11_matches_focused_window_when_xprop_omits_leading_zeroes(monkeypatch):
+    backend = _backend(monkeypatch, active_id="0x1200001")
+
+    windows = backend.list_windows()
+    focused = backend.get_focused_window()
+
+    assert windows.focused_window is not None
+    assert windows.focused_window.id == "0x01200001"
+    assert focused.success
+    assert focused.window is not None
+    assert focused.window.id == "0x01200001"
 
 
 def test_x11_resize_rechecks_the_reported_geometry(monkeypatch):
