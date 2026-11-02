@@ -104,6 +104,37 @@ async def test_missing_session_bus_address_becomes_a_bounded_portal_error(monkey
 
 
 @pytest.mark.asyncio
+async def test_portal_bus_negotiates_unix_file_descriptors(monkeypatch):
+    created_options = []
+
+    class FakeBus:
+        connected = True
+
+        async def connect(self):
+            return self
+
+        def add_message_handler(self, _handler):
+            pass
+
+    def fake_message_bus(**options):
+        created_options.append(options)
+        return FakeBus()
+
+    monkeypatch.setattr("wayland_mcp.portal.get_sanitized_env", lambda: {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/test-session-bus",
+    })
+    monkeypatch.setattr("wayland_mcp.portal.MessageBus", fake_message_bus)
+
+    connected = await _PortalBus().connect()
+
+    assert connected.connected is True
+    assert created_options == [{
+        "bus_address": "unix:path=/tmp/test-session-bus",
+        "negotiate_unix_fd": True,
+    }]
+
+
+@pytest.mark.asyncio
 async def test_startup_combines_input_and_screen_permissions_and_never_prompts_again(monkeypatch):
     portal = RemoteDesktopPortal()
 

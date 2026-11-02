@@ -142,9 +142,9 @@ class _PortalBus:
         address = env.get("DBUS_SESSION_BUS_ADDRESS")
         try:
             if address:
-                bus = MessageBus(bus_address=address)
+                bus = MessageBus(bus_address=address, negotiate_unix_fd=True)
             else:
-                bus = MessageBus(bus_type=BusType.SESSION)
+                bus = MessageBus(bus_type=BusType.SESSION, negotiate_unix_fd=True)
             self.bus = await bus.connect()
         except (DBusError, InvalidAddressError, OSError, asyncio.TimeoutError) as exc:
             self.bus = None
