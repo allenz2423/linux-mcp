@@ -4916,14 +4916,17 @@ async def _confirm_network_manager_vpn_import(
         credential_note = "Inline certificates, private keys, or passwords may be stored by NetworkManager."
     else:
         supported_format = (
-            "Only the bounded wg-quick Interface/Peer subset is accepted; shell hooks, file-based keys, and unsupported settings are refused."
+            "Only the bounded wg-quick Interface/Peer subset is accepted; shell hooks, file-based keys, and unsupported settings are refused. Each DNS address family must also have an Interface Address."
         )
         credential_note = "The WireGuard private key and optional peer preshared keys may be stored by NetworkManager."
+    if target.vpn_type == "openvpn":
+        handling_note = "The source is copied to a private temporary file for import; the original file is not changed."
+    else:
+        handling_note = "NetworkManager receives the WireGuard settings over system D-Bus with autoconnect disabled when the profile is created; the original file is not changed."
     return Elicit(
         f"Confirm importing {target.vpn_type} file {target.source.requested_path!r} ({target.source.size_bytes} bytes) "
         f"as persistent NetworkManager profile {target.profile_name!r}? The complete source content and profile "
-        "inventory are bound to this confirmation. The configuration is copied to a private temporary file for "
-        f"import; the original file is not changed. The result will remain inactive with autoconnect disabled. {supported_format} "
+        f"inventory are bound to this confirmation. {handling_note} The result will remain inactive with autoconnect disabled. {supported_format} "
         f"{credential_note} The configuration is not displayed by this tool. "
         "Activating the profile later may change routes or disconnect this client. Current OS permissions apply; "
         "the server requests no privilege elevation. Repeat the type, exact source path, profile name, and "
@@ -7357,7 +7360,7 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
             confirmed_phrase=confirmation.data.confirmation_phrase,
         )
 
-    @tool(name="import_network_manager_vpn_profile", description="After exact confirmation, import one self-contained OpenVPN or WireGuard config into a persistent NetworkManager profile. OpenVPN inline credential blocks are supported while known external file, include, management-socket, and helper-command directives are refused. WireGuard accepts a bounded wg-quick Interface/Peer subset and rejects shell hooks, file-based keys, and unsupported settings. The source must be a readable regular file no larger than 1 MiB; its complete content and the full profile inventory are bound to confirmation and revalidated. The tool stages a private temporary copy, hides nmcli output, never queries profile secrets, sets the requested name and autoconnect off, and verifies one inactive profile. It does not activate the VPN or request privilege elevation. Inline certificates, private keys, or passwords may be saved by NetworkManager; later activation can change routes or disconnect this MCP client.")
+    @tool(name="import_network_manager_vpn_profile", description="After exact confirmation, import one self-contained OpenVPN or WireGuard config into a persistent NetworkManager profile. OpenVPN inline credential blocks are supported while known external file, include, management-socket, and helper-command directives are refused. WireGuard accepts a bounded wg-quick Interface/Peer subset and rejects shell hooks, file-based keys, and unsupported settings; each DNS address family must also have an Interface Address. The source must be a readable regular file no larger than 1 MiB; its complete content and the full profile inventory are bound to confirmation and revalidated. OpenVPN is staged in a private temporary copy; WireGuard is added through one NetworkManager D-Bus call with autoconnect disabled at creation. The tool hides command output, never queries profile secrets, verifies one inactive profile, and does not activate the VPN or request privilege elevation. Inline certificates, private keys, or passwords may be saved by NetworkManager; later activation can change routes or disconnect this MCP client.")
     async def tool_import_network_manager_vpn_profile(
         vpn_type: NetworkManagerVPNType,
         source_path: str,

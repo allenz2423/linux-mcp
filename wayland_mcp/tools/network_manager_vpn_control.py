@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import ipaddress
 import json
 import os
 import re
+import secrets
 import shlex
 import stat
 import sys
 import tempfile
 import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -33,6 +36,8 @@ MAX_VPN_CONFIG_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 QUERY_TIMEOUT_SECONDS = 6
 ACTION_TIMEOUT_SECONDS = 20
+_NM_ADD_TO_DISK = 0x01
+_NM_ADD_BLOCK_AUTOCONNECT = 0x20
 _ACTION_LOCK = threading.Lock()
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 _INLINE_BLOCK_NAMES = frozenset({
@@ -319,6 +324,21 @@ def _validate_wireguard_config(payload: bytes) -> str | None:
                         ipaddress.ip_address(item)
                 except ValueError:
                     return f"The WireGuard {list_key} setting must contain literal IP addresses/prefixes."
+    address_families = {
+        ipaddress.ip_interface(item.strip()).version
+        for raw_value in interface_values.get("Address", [])
+        for item in raw_value.split(",")
+    }
+    dns_families = {
+        ipaddress.ip_address(item.strip()).version
+        for raw_value in interface_values.get("DNS", [])
+        for item in raw_value.split(",")
+    }
+    if dns_families - address_families:
+        return (
+            "Each WireGuard DNS address family must also have a configured Interface Address; "
+            "NetworkManager cannot apply DNS to a disabled IP family."
+        )
     for key, minimum, maximum in (("MTU", 576, 65535), ("ListenPort", 0, 65535)):
         for value in interface_values.get(key, []):
             if not _integer_in_range(value, minimum, maximum):
@@ -459,7 +479,7 @@ def _write_staged_source(payload: bytes, vpn_type: VPNType) -> str | None:
         prefix, suffix = (
             ("linux-mcp-openvpn-", ".ovpn")
             if vpn_type == "openvpn"
-            else ("linux-mcp-wireguard-", ".conf")
+            else ("wg", ".conf")
         )
         fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir="/tmp")
         os.fchmod(fd, 0o600)
@@ -481,6 +501,257 @@ def _write_staged_source(payload: bytes, vpn_type: VPNType) -> str | None:
             except OSError:
                 pass
         return None
+
+
+def _wireguard_connection_settings(
+    payload: bytes,
+    profile_name: str,
+    profile_uuid: str,
+    interface_name: str,
+) -> dict[str, dict[str, object]]:
+    """Build native NetworkManager settings without putting keys in argv."""
+    validation_error = _validate_wireguard_config(payload)
+    if validation_error:
+        raise ValueError(validation_error)
+    try:
+        from dbus_next import Variant
+    except ImportError as exc:
+        raise RuntimeError("NetworkManager D-Bus support is unavailable.") from exc
+
+    text = payload.decode("utf-8", errors="strict")
+    interface: dict[str, list[str]] = {}
+    peers: list[dict[str, list[str]]] = []
+    current = interface
+    for raw_line in text.splitlines():
+        line = raw_line.partition("#")[0].strip()
+        if not line:
+            continue
+        if line == "[Interface]":
+            current = interface
+            continue
+        if line == "[Peer]":
+            current = {}
+            peers.append(current)
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        current.setdefault(key, []).append(value)
+
+    def values(key: str) -> list[str]:
+        return [item.strip() for raw in interface.get(key, []) for item in raw.split(",")]
+
+    addresses: dict[int, list[ipaddress.IPv4Interface | ipaddress.IPv6Interface]] = {
+        4: [],
+        6: [],
+    }
+    for address in values("Address"):
+        parsed = ipaddress.ip_interface(address)
+        addresses[parsed.version].append(parsed)
+    dns: dict[int, list[str]] = {4: [], 6: []}
+    for server in values("DNS"):
+        parsed = ipaddress.ip_address(server)
+        dns[parsed.version].append(str(parsed))
+
+    def address_data(version: int):
+        return Variant(
+            "aa{sv}",
+            [
+                {
+                    "address": Variant("s", str(address.ip)),
+                    "prefix": Variant("u", address.network.prefixlen),
+                }
+                for address in addresses[version]
+            ],
+        )
+
+    wireguard_peers: list[dict[str, object]] = []
+    for peer in peers:
+        peer_settings: dict[str, object] = {
+            "public-key": Variant("s", peer["PublicKey"][0]),
+            "allowed-ips": Variant(
+                "as",
+                [item.strip() for item in peer["AllowedIPs"][0].split(",")],
+            ),
+        }
+        if peer.get("Endpoint"):
+            peer_settings["endpoint"] = Variant("s", peer["Endpoint"][0])
+        if peer.get("PresharedKey"):
+            peer_settings["preshared-key"] = Variant("s", peer["PresharedKey"][0])
+            peer_settings["preshared-key-flags"] = Variant("u", 0)
+        if peer.get("PersistentKeepalive"):
+            keepalive = peer["PersistentKeepalive"][0]
+            if keepalive.casefold() != "off" and int(keepalive, 10) > 0:
+                peer_settings["persistent-keepalive"] = Variant("u", int(keepalive, 10))
+        wireguard_peers.append(peer_settings)
+
+    private_key = interface["PrivateKey"][0]
+    wireguard: dict[str, object] = {
+        "private-key": Variant("s", private_key),
+        "private-key-flags": Variant("u", 0),
+        "peers": Variant("aa{sv}", wireguard_peers),
+    }
+    if interface.get("ListenPort"):
+        wireguard["listen-port"] = Variant("u", int(interface["ListenPort"][0], 10))
+    if interface.get("MTU"):
+        wireguard["mtu"] = Variant("u", int(interface["MTU"][0], 10))
+    if interface.get("FwMark"):
+        mark = interface["FwMark"][0]
+        base = 16 if mark.lower().startswith("0x") else 10
+        wireguard["fwmark"] = Variant(
+            "u", 0 if mark.casefold() == "off" else int(mark, base)
+        )
+
+    settings: dict[str, dict[str, object]] = {
+        "connection": {
+            "id": Variant("s", profile_name),
+            "uuid": Variant("s", profile_uuid),
+            "type": Variant("s", "wireguard"),
+            "interface-name": Variant("s", interface_name),
+            "autoconnect": Variant("b", False),
+        },
+        "wireguard": wireguard,
+    }
+    for version in (4, 6):
+        ip_settings: dict[str, object] = {
+            "method": Variant("s", "manual" if addresses[version] else "disabled"),
+        }
+        if addresses[version]:
+            ip_settings["address-data"] = address_data(version)
+        if dns[version]:
+            ip_settings["dns-data"] = Variant("as", dns[version])
+        settings[f"ipv{version}"] = ip_settings
+    return settings
+
+
+def _legacy_wireguard_dns_settings(
+    settings: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Use the older D-Bus DNS properties on NetworkManager without dns-data."""
+    from dbus_next import Variant
+
+    legacy = {name: dict(properties) for name, properties in settings.items()}
+    for version in (4, 6):
+        section = legacy[f"ipv{version}"]
+        dns_data = section.pop("dns-data", None)
+        if dns_data is None:
+            continue
+        servers = dns_data.value
+        if version == 4:
+            section["dns"] = Variant(
+                "au", [int(ipaddress.IPv4Address(server)) for server in servers]
+            )
+        else:
+            section["dns"] = Variant(
+                "aay", [ipaddress.IPv6Address(server).packed for server in servers]
+            )
+    return legacy
+
+
+async def _add_wireguard_profile_dbus(settings: dict[str, dict[str, object]]) -> None:
+    from dbus_next import BusType, DBusError
+    from dbus_next.aio import MessageBus
+
+    bus = await asyncio.wait_for(
+        MessageBus(bus_type=BusType.SYSTEM).connect(),
+        timeout=QUERY_TIMEOUT_SECONDS,
+    )
+    try:
+        path = "/org/freedesktop/NetworkManager/Settings"
+        introspection = await asyncio.wait_for(
+            bus.introspect("org.freedesktop.NetworkManager", path),
+            timeout=QUERY_TIMEOUT_SECONDS,
+        )
+        interface = bus.get_proxy_object(
+            "org.freedesktop.NetworkManager", path, introspection
+        ).get_interface("org.freedesktop.NetworkManager.Settings")
+        add_connection2 = getattr(interface, "call_add_connection2", None)
+        if add_connection2 is None:
+            try:
+                await asyncio.wait_for(
+                    interface.call_add_connection(settings),
+                    timeout=ACTION_TIMEOUT_SECONDS,
+                )
+            except DBusError as exc:
+                if "dns-data" not in str(exc).casefold():
+                    raise
+                legacy_settings = _legacy_wireguard_dns_settings(settings)
+                await asyncio.wait_for(
+                    interface.call_add_connection(legacy_settings),
+                    timeout=ACTION_TIMEOUT_SECONDS,
+                )
+            return
+        try:
+            await asyncio.wait_for(
+                add_connection2(
+                    settings,
+                    _NM_ADD_TO_DISK | _NM_ADD_BLOCK_AUTOCONNECT,
+                    {},
+                ),
+                timeout=ACTION_TIMEOUT_SECONDS,
+            )
+        except DBusError as exc:
+            if "dns-data" not in str(exc).casefold():
+                raise
+            legacy_settings = _legacy_wireguard_dns_settings(settings)
+            await asyncio.wait_for(
+                add_connection2(
+                    legacy_settings,
+                    _NM_ADD_TO_DISK | _NM_ADD_BLOCK_AUTOCONNECT,
+                    {},
+                ),
+                timeout=ACTION_TIMEOUT_SECONDS,
+            )
+    finally:
+        bus.disconnect()
+
+
+def _add_wireguard_profile(settings: dict[str, dict[str, object]]) -> bool:
+    """Add one inactive persistent native WireGuard profile via NetworkManager."""
+    try:
+        asyncio.run(_add_wireguard_profile_dbus(settings))
+    except Exception:
+        # D-Bus exceptions can include profile data; do not expose their text.
+        return False
+    return True
+
+
+def _remove_unverified_wireguard_profile(
+    binary: str,
+    env: dict[str, str],
+    profile_uuid: str,
+    profile_name: str,
+    old_uuids: set[str],
+) -> bool:
+    if profile_uuid in old_uuids:
+        return False
+    profiles, error = _read_profile_inventory(binary, env)
+    if error or profiles is None:
+        return False
+    profile = next((item for item in profiles if item.uuid == profile_uuid), None)
+    if profile is None:
+        return True
+    if profile.name != profile_name or profile.connection_type.casefold() != "wireguard":
+        return False
+    if profile.device is not None:
+        _run_command(
+            binary,
+            ["--wait", "12", "connection", "down", "uuid", profile_uuid],
+            env,
+            label="Deactivate unverified temporary WireGuard import",
+            timeout=ACTION_TIMEOUT_SECONDS,
+        )
+    _run_command(
+        binary,
+        ["--wait", "12", "connection", "delete", "uuid", profile_uuid],
+        env,
+        label="Remove unverified WireGuard import profile",
+        timeout=ACTION_TIMEOUT_SECONDS,
+    )
+    remaining, error = _read_profile_inventory(binary, env)
+    return (
+        not error
+        and remaining is not None
+        and all(item.uuid != profile_uuid for item in remaining)
+    )
 
 
 def _run_command(
@@ -577,7 +848,10 @@ def perform_network_manager_vpn_import(
                 target.profile_name,
                 source_name,
                 size_bytes,
-                error or "The source file or NetworkManager profile inventory changed after confirmation; no import was run.",
+                error
+                or (
+                    "The source file or NetworkManager profile inventory changed after confirmation; no import was run."
+                ),
                 user_confirmed=True,
             )
         current_source, payload, source_error = _read_source(source_path)
@@ -606,56 +880,132 @@ def perform_network_manager_vpn_import(
                 "NetworkManager's nmcli command became unavailable; no import was run.",
                 user_confirmed=True,
             )
-        staged_path = _write_staged_source(payload, target.vpn_type)
-        if staged_path is None:
-            return _failure(
-                target.vpn_type,
-                target.profile_name,
-                source_name,
-                size_bytes,
-                "A private temporary copy of the confirmed VPN source could not be staged; no import was run.",
-                user_confirmed=True,
-            )
-        try:
-            _output, import_error, truncated = _run_command(
-                binary,
-                ["--wait", "12", "connection", "import", "type", target.vpn_type, "file", staged_path],
-                env,
-                label=f"Import confirmed {target.vpn_type} configuration into NetworkManager",
-                timeout=ACTION_TIMEOUT_SECONDS,
-            )
-        finally:
-            try:
-                os.unlink(staged_path)
-            except OSError:
-                pass
-        if import_error or _output is None or truncated:
-            return _failure(
-                target.vpn_type,
-                target.profile_name,
-                source_name,
-                size_bytes,
-                f"NetworkManager did not complete the {target.vpn_type} import. Inspect its profile inventory before retrying; command output is withheld.",
-                user_confirmed=True,
-            )
-        profiles, read_error = _read_profile_inventory(binary, env)
         old_uuids = {profile.uuid for profile in current.profiles_before}
+        wireguard_uuid: str | None = None
+        if target.vpn_type == "wireguard":
+            wireguard_uuid = str(uuid.uuid4())
+            while wireguard_uuid in old_uuids:
+                wireguard_uuid = str(uuid.uuid4())
+            interface_name = f"wg{secrets.token_hex(5)}"
+            for _attempt in range(4):
+                if not os.path.exists(f"/sys/class/net/{interface_name}"):
+                    break
+                interface_name = f"wg{secrets.token_hex(5)}"
+            else:
+                wireguard_uuid = None
+                return _failure(
+                    target.vpn_type,
+                    target.profile_name,
+                    source_name,
+                    size_bytes,
+                    "A unique inactive WireGuard interface name could not be selected; no profile was added.",
+                    user_confirmed=True,
+                )
+            try:
+                settings = _wireguard_connection_settings(
+                    payload,
+                    target.profile_name,
+                    wireguard_uuid,
+                    interface_name,
+                )
+            except (ValueError, RuntimeError, UnicodeError):
+                wireguard_uuid = None
+                return _failure(
+                    target.vpn_type,
+                    target.profile_name,
+                    source_name,
+                    size_bytes,
+                    "The validated WireGuard profile could not be prepared for NetworkManager; no profile was added.",
+                    user_confirmed=True,
+                )
+            if not _add_wireguard_profile(settings):
+                removed = _remove_unverified_wireguard_profile(
+                    binary,
+                    env,
+                    wireguard_uuid,
+                    target.profile_name,
+                    old_uuids,
+                )
+                return _failure(
+                    target.vpn_type,
+                    target.profile_name,
+                    source_name,
+                    size_bytes,
+                    "NetworkManager did not add the confirmed WireGuard profile. Inspect its profile inventory "
+                    "before retrying; key data is withheld.",
+                    user_confirmed=True,
+                    profile_uuid=None if removed else wireguard_uuid,
+                )
+        else:
+            staged_path = _write_staged_source(payload, target.vpn_type)
+            if staged_path is None:
+                return _failure(
+                    target.vpn_type,
+                    target.profile_name,
+                    source_name,
+                    size_bytes,
+                    "A private temporary copy of the confirmed VPN source could not be staged; no import was run.",
+                    user_confirmed=True,
+                )
+            try:
+                _output, import_error, truncated = _run_command(
+                    binary,
+                    [
+                        "--wait", "12", "connection", "import", "type",
+                        target.vpn_type, "file", staged_path,
+                    ],
+                    env,
+                    label=f"Import confirmed {target.vpn_type} configuration into NetworkManager",
+                    timeout=ACTION_TIMEOUT_SECONDS,
+                )
+            finally:
+                try:
+                    os.unlink(staged_path)
+                except OSError:
+                    pass
+            if import_error or _output is None or truncated:
+                return _failure(
+                    target.vpn_type,
+                    target.profile_name,
+                    source_name,
+                    size_bytes,
+                    "NetworkManager did not complete the OpenVPN import. Inspect its profile inventory "
+                    "before retrying; command output is withheld.",
+                    user_confirmed=True,
+                )
+        profiles, read_error = _read_profile_inventory(binary, env)
         created_profiles = [profile for profile in profiles or () if profile.uuid not in old_uuids]
         if (
             read_error
             or profiles is None
             or len(created_profiles) != 1
+            or (wireguard_uuid is not None and created_profiles[0].uuid != wireguard_uuid)
             or created_profiles[0].connection_type.casefold()
             != ("vpn" if target.vpn_type == "openvpn" else "wireguard")
             or created_profiles[0].device is not None
+            or (target.vpn_type == "wireguard" and created_profiles[0].name != target.profile_name)
+            or (target.vpn_type == "wireguard" and created_profiles[0].autoconnect is not False)
         ):
+            leftover_uuid = None
+            if wireguard_uuid is not None:
+                removed = _remove_unverified_wireguard_profile(
+                    binary,
+                    env,
+                    wireguard_uuid,
+                    target.profile_name,
+                    old_uuids,
+                )
+                if not removed:
+                    leftover_uuid = wireguard_uuid
             return _failure(
                 target.vpn_type,
                 target.profile_name,
                 source_name,
                 size_bytes,
-                "The import command ran, but NetworkManager did not produce exactly one inactive VPN profile. Inspect profiles before retrying.",
+                "NetworkManager did not produce exactly one inactive VPN profile with the requested identity. "
+                "Inspect profiles before retrying.",
                 user_confirmed=True,
+                profile_uuid=leftover_uuid,
             )
         created = created_profiles[0]
         before_rows = tuple(_profile_payload(profile) for profile in current.profiles_before)
@@ -670,27 +1020,29 @@ def perform_network_manager_vpn_import(
                 user_confirmed=True,
                 profile_uuid=created.uuid,
             )
-        _modify_output, modify_error, modify_truncated = _run_command(
-            binary,
-            [
-                "--wait", "12", "connection", "modify", "uuid", created.uuid,
-                "connection.id", current.profile_name,
-                "connection.autoconnect", "no",
-            ],
-            env,
-            label="Set confirmed imported VPN profile name and autoconnect state",
-            timeout=ACTION_TIMEOUT_SECONDS,
-        )
-        if modify_error or _modify_output is None or modify_truncated:
-            return _failure(
-                target.vpn_type,
-                target.profile_name,
-                source_name,
-                size_bytes,
-                "The VPN profile was imported but its requested name or autoconnect setting could not be saved. Inspect it before retrying.",
-                user_confirmed=True,
-                profile_uuid=created.uuid,
+        if target.vpn_type == "openvpn":
+            _modify_output, modify_error, modify_truncated = _run_command(
+                binary,
+                [
+                    "--wait", "12", "connection", "modify", "uuid", created.uuid,
+                    "connection.id", current.profile_name,
+                    "connection.autoconnect", "no",
+                ],
+                env,
+                label="Set confirmed imported VPN profile name and autoconnect state",
+                timeout=ACTION_TIMEOUT_SECONDS,
             )
+            if modify_error or _modify_output is None or modify_truncated:
+                return _failure(
+                    target.vpn_type,
+                    target.profile_name,
+                    source_name,
+                    size_bytes,
+                    "The VPN profile was imported but its requested name or autoconnect setting could not be saved. "
+                    "Inspect it before retrying.",
+                    user_confirmed=True,
+                    profile_uuid=created.uuid,
+                )
         final_profiles, verify_error = _read_profile_inventory(binary, env)
         if verify_error or final_profiles is None:
             return _failure(
@@ -722,7 +1074,8 @@ def perform_network_manager_vpn_import(
                 target.profile_name,
                 source_name,
                 size_bytes,
-                "The imported profile exists but its final saved identity or inactive state did not match; inspect it before activation.",
+                "The imported profile exists but its final saved identity or inactive state did not match; "
+                "inspect it before activation.",
                 user_confirmed=True,
                 profile_uuid=created.uuid,
             )
@@ -735,7 +1088,8 @@ def perform_network_manager_vpn_import(
             size_bytes=size_bytes,
             user_confirmed=True,
             message=(
-                f"Imported and verified one persistent {target.vpn_type} profile. It remains inactive with autoconnect disabled; "
+                f"Imported and verified one persistent {target.vpn_type} profile. It remains inactive "
+                "with autoconnect disabled; "
                 "NetworkManager profile secrets were not queried or returned. The imported configuration may contain "
                 "private keys or credentials stored by NetworkManager."
             ),
