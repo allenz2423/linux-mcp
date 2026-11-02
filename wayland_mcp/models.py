@@ -4755,12 +4755,12 @@ class PythonEnvironmentActionConfirmation(BaseModel):
     )
     package_name: str = Field(
         default="",
-        pattern=r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$",
+        pattern=r"^(?:[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?)?$",
         description="Repeat one exact Python project name; empty only when creating an environment",
     )
     version: str = Field(
         default="",
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9.!+_-]{0,127}$",
+        pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9.!+_-]{0,127})?$",
         description="Repeat one exact version for install, or an empty string for other actions",
     )
     expected_state_token: str = Field(

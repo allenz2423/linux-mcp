@@ -68,3 +68,21 @@ def test_binary_upload_schema_matches_runtime_limit() -> None:
 
     assert upload.input_schema["properties"]["expected_size"]["maximum"] == MAX_BINARY_UPLOAD_BYTES
     assert append.input_schema["properties"]["offset"]["maximum"] == MAX_BINARY_UPLOAD_BYTES
+
+
+def test_python_environment_create_confirmation_accepts_empty_optional_fields() -> None:
+    from wayland_mcp.models import PythonEnvironmentActionConfirmation
+
+    confirmation = PythonEnvironmentActionConfirmation.model_validate(
+        {
+            "confirm": True,
+            "action": "create",
+            "environment_name": "live-check",
+            "package_name": "",
+            "version": "",
+            "expected_state_token": "0" * 64,
+        }
+    )
+
+    assert confirmation.package_name == ""
+    assert confirmation.version == ""
