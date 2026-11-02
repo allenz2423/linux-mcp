@@ -210,8 +210,9 @@ def lookup_nss_identity(kind: Literal["user", "group"], identity: str) -> NSSIde
             message="The optional getent command is unavailable.",
         )
 
+    database = "passwd" if kind == "user" else "group"
     output, error, output_truncated = run_bounded_command(
-        [getent, kind, identity],
+        [getent, database, identity],
         env,
         command_label="NSS identity lookup",
         timeout_seconds=NSS_LOOKUP_TIMEOUT_SECONDS,

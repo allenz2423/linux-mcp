@@ -126,9 +126,11 @@ def _run_mutation(
     *,
     device_fd: int,
     extra_fds: tuple[int, ...] = (),
+    umask: int | None = None,
 ) -> bool:
     env = _environment()
     input_options = {"input": key_data} if key_data is not None else {"stdin": subprocess.DEVNULL}
+    process_options = {"umask": umask} if umask is not None else {}
     try:
         completed = subprocess.run(
             command,
@@ -140,6 +142,7 @@ def _run_mutation(
             close_fds=True,
             pass_fds=(device_fd, *extra_fds),
             **input_options,
+            **process_options,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -1376,6 +1379,7 @@ def perform_luks_header_action(
         parent_fd = -1
         staging_fd = -1
         staging_name: str | None = None
+        staging_identity: tuple[int, int] | None = None
         published = False
         published_identity: tuple[int, int] | None = None
         result_info: dict[str, int | str] | None = None
@@ -1393,29 +1397,50 @@ def perform_luks_header_action(
             for _ in range(16):
                 candidate = f".linux-mcp-luks-header-{secrets.token_hex(16)}"
                 try:
-                    staging_fd = os.open(
-                        candidate,
-                        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-                        0o600,
-                        dir_fd=parent_fd,
-                    )
-                except FileExistsError:
+                    os.stat(candidate, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    staging_name = candidate
+                    break
+                else:
                     continue
-                staging_name = candidate
-                break
-            if staging_fd < 0 or staging_name is None:
-                raise OSError("Could not allocate a private staging file in the verified backup directory.")
-            os.fchmod(staging_fd, 0o600)
-            staging_before = os.fstat(staging_fd)
-            staging_fd_path = f"/proc/self/fd/{staging_fd}"
-            command = [cryptsetup, "luksHeaderBackup", "--batch-mode", "--header-backup-file", staging_fd_path, device_argument]
-            if not _run_mutation(command, None, device_fd=device_fd, extra_fds=(staging_fd,)):
+            if staging_name is None:
+                raise OSError("Could not allocate a private staging path in the verified backup directory.")
+            staging_path = f"/proc/self/fd/{parent_fd}/{staging_name}"
+            command = [
+                cryptsetup,
+                "luksHeaderBackup",
+                "--batch-mode",
+                "--header-backup-file",
+                staging_path,
+                device_argument,
+            ]
+            mutation_succeeded = _run_mutation(
+                command,
+                None,
+                device_fd=device_fd,
+                extra_fds=(parent_fd,),
+                umask=0o077,
+            )
+            try:
+                staging_fd = os.open(
+                    staging_name,
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                if not mutation_succeeded:
+                    raise RuntimeError("cryptsetup did not complete the header backup.")
+                raise OSError("cryptsetup reported success without creating a header backup.")
+            staging_info = os.fstat(staging_fd)
+            staging_identity = (staging_info.st_dev, staging_info.st_ino)
+            if not mutation_succeeded:
                 raise RuntimeError("cryptsetup did not complete the header backup.")
             os.fsync(staging_fd)
+            staging_fd_path = f"/proc/self/fd/{staging_fd}"
             result_info, error = _fingerprint_header_fd(staging_fd)
             if error or result_info is None:
                 raise OSError(error or "The output backup could not be verified.")
-            if (int(result_info["device"]), int(result_info["inode"])) != (staging_before.st_dev, staging_before.st_ino):
+            if (int(result_info["device"]), int(result_info["inode"])) != staging_identity:
                 raise OSError("The staged backup file identity changed during creation.")
             device_fd_path = f"/proc/self/fd/{device_fd}"
             staged_pass_fds = (device_fd, staging_fd)
@@ -1451,13 +1476,13 @@ def perform_luks_header_action(
             ):
                 raise OSError("The block-device LUKS state changed while the backup was being created.")
             staged_path_info = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
-            if (staged_path_info.st_dev, staged_path_info.st_ino) != (staging_before.st_dev, staging_before.st_ino):
+            if (staged_path_info.st_dev, staged_path_info.st_ino) != staging_identity:
                 raise OSError("The staged backup path identity changed during creation.")
             os.link(staging_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
             published_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             published_identity = (published_info.st_dev, published_info.st_ino)
             published = True
-            if (published_info.st_dev, published_info.st_ino) != (staging_before.st_dev, staging_before.st_ino):
+            if (published_info.st_dev, published_info.st_ino) != staging_identity:
                 raise OSError("The published backup path identity could not be verified.")
             os.unlink(staging_name, dir_fd=parent_fd)
             staging_name = None
@@ -1470,9 +1495,11 @@ def perform_luks_header_action(
                         os.unlink(name, dir_fd=parent_fd)
                 except OSError:
                     pass
-            if staging_name is not None and parent_fd >= 0:
+            if staging_name is not None and staging_identity is not None and parent_fd >= 0:
                 try:
-                    os.unlink(staging_name, dir_fd=parent_fd)
+                    staged_path_info = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+                    if (staged_path_info.st_dev, staged_path_info.st_ino) == staging_identity:
+                        os.unlink(staging_name, dir_fd=parent_fd)
                 except OSError:
                     pass
             if staging_fd >= 0:
@@ -1565,7 +1592,8 @@ def perform_luks_header_action(
                     else None
                 )
                 backup_after_info, backup_after_error = _fingerprint_header_fd(backup_fd)
-                backup_path_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                backup_name = Path(target.backup_file).name
+                backup_path_info = os.stat(backup_name, dir_fd=parent_fd, follow_symlinks=False)
                 backup_path_matches = (
                     (backup_path_info.st_dev, backup_path_info.st_ino) == target.backup_file_identity
                     and backup_after_info is not None

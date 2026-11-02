@@ -131,6 +131,8 @@ def _table_rows(
     output: str,
     required_headers: set[str],
 ) -> tuple[list[dict[str, str]], bool, str | None]:
+    if not output.strip():
+        return [], False, None
     lines = output.splitlines()
     header_index: int | None = None
     headers: list[str] = []
