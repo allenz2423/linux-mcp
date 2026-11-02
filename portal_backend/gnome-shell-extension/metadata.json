@@ -1,0 +1,7 @@
+{
+  "uuid": "linux-mcp-window-control@linux-mcp-general-purpose",
+  "name": "Linux MCP Window Control",
+  "description": "Exposes bounded window and workspace operations to the local Linux MCP helper.",
+  "version": 1,
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51", "52"]
+}

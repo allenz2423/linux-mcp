@@ -1,0 +1,30 @@
+[project]
+name = "linux-mcp"
+version = "0.1.0"
+description = "Standalone Linux Model Context Protocol server for host and desktop observation and control"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "Adam Team" }
+]
+dependencies = [
+    "mcp>=2.3.0,<3",
+    "pydantic>=2.0.0",
+    "dbus-next>=0.2.3,<0.3",
+]
+
+[project.scripts]
+linux-mcp = "wayland_mcp.__main__:main"
+# Keep the original launcher available for existing MCP client configurations.
+wayland-mcp = "wayland_mcp.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pyyaml>=6.0"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["wayland_mcp*"]
+exclude = ["tests*"]

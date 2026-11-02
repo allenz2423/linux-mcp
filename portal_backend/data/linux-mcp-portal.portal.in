@@ -1,0 +1,4 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.linux_mcp
+Interfaces=org.freedesktop.impl.portal.RemoteDesktop;
+UseIn=wlroots;Hyprland;sway;Wayfire;river;niri;

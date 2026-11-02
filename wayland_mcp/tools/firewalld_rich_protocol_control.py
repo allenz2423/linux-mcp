@@ -1,0 +1,457 @@
+"""Typed, confirmed firewalld rich IP-protocol rules for one exact zone."""
+
+from __future__ import annotations
+
+import ipaddress
+import re
+import secrets
+import socket
+import threading
+import time
+from dataclasses import dataclass
+from typing import Literal
+
+from wayland_mcp.models import FirewalldRichProtocolRuleActionResponse
+from wayland_mcp.tools.firewalld_icmp_control import (
+    ZONE_NAME_RE,
+    _binary,
+    _environment,
+)
+from wayland_mcp.tools.firewalld_rich_rule_control import (
+    LOG_PREFIX_RE,
+    TOKEN_RE,
+    _command,
+    _read_snapshot,
+)
+
+FirewalldRichProtocolRuleAction = Literal["add", "remove"]
+FirewalldRichProtocolRuleVerdict = Literal["accept", "reject", "drop"]
+FirewalldRichProtocolRuleLogLevel = Literal[
+    "emerg", "alert", "crit", "error", "warning", "notice", "info", "debug",
+]
+PROTOCOL_VALUE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$|^(?:0|[1-9][0-9]{0,2})$")
+TOKEN_TTL_SECONDS = 180
+MAX_PENDING_TOKENS = 1_024
+ACTION_LOCK = threading.Lock()
+ALLOWED_LOG_LEVELS = {"emerg", "alert", "crit", "error", "warning", "notice", "info", "debug"}
+
+
+@dataclass(frozen=True, slots=True)
+class _RuleSnapshot:
+    zone_active: bool | None
+    matching_count: int
+
+
+@dataclass(slots=True)
+class _RuleToken:
+    request: tuple[object, ...]
+    zone_active: bool | None
+    matching_count: int
+    rich_rule: str
+    protocol_number: int
+    expires_at: float
+    claimed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FirewalldRichProtocolRuleTarget:
+    action: str
+    configuration: str
+    zone: str
+    protocol_value: str
+    protocol_number: int
+    source_cidr: str | None
+    destination_cidr: str | None
+    verdict: str
+    log_enabled: bool
+    log_prefix: str | None
+    log_level: str | None
+    audit_enabled: bool
+    priority: int | None
+    zone_active: bool | None
+    rich_rule: str
+    matching_count: int
+    confirmation_token: str
+
+
+_TOKENS: dict[str, _RuleToken] = {}
+
+
+def _resolve_protocol(value: object) -> tuple[str | None, int | None]:
+    if not isinstance(value, str) or len(value) > 64 or not PROTOCOL_VALUE_RE.fullmatch(value):
+        return None, None
+    if value.isdecimal():
+        number = int(value, 10)
+        return (value, number) if 0 <= number <= 255 else (None, None)
+    try:
+        number = socket.getprotobyname(value)
+    except OSError:
+        return None, None
+    if not isinstance(number, int) or not 0 <= number <= 255:
+        return None, None
+    return value, number
+
+
+def _normalize_request(
+    action: object,
+    configuration: object,
+    zone: object,
+    protocol_value: object,
+    source_cidr: object = None,
+    destination_cidr: object = None,
+    verdict: object = "accept",
+    log_enabled: object = False,
+    log_prefix: object = None,
+    log_level: object = None,
+    audit_enabled: object = False,
+    priority: object = None,
+) -> tuple[tuple[object, ...] | None, str | None]:
+    if not isinstance(action, str) or action not in {"add", "remove"}:
+        return None, "Choose add or remove."
+    if not isinstance(configuration, str) or configuration not in {"runtime", "permanent"}:
+        return None, "Choose runtime or permanent configuration."
+    if not isinstance(zone, str) or not ZONE_NAME_RE.fullmatch(zone):
+        return None, "Use one exact existing firewalld zone name from the frontend inventory."
+    normalized_protocol, protocol_number = _resolve_protocol(protocol_value)
+    if normalized_protocol is None or protocol_number is None:
+        return None, "protocol_value must be an IP protocol name from the local protocol database or a number from 0 through 255."
+    if not isinstance(verdict, str) or verdict not in {"accept", "reject", "drop"}:
+        return None, "Verdict must be accept, reject, or drop."
+    if not isinstance(log_enabled, bool) or not isinstance(audit_enabled, bool):
+        return None, "log_enabled and audit_enabled must be booleans."
+    if not log_enabled and (log_prefix is not None or log_level is not None):
+        return None, "log_prefix and log_level require log_enabled=true."
+    if log_prefix is not None and (
+        not isinstance(log_prefix, str) or not LOG_PREFIX_RE.fullmatch(log_prefix)
+    ):
+        return None, "log_prefix must contain 1-127 safe printable characters."
+    if log_level is not None and (
+        not isinstance(log_level, str) or log_level not in ALLOWED_LOG_LEVELS
+    ):
+        return None, "log_level must be one of emerg, alert, crit, error, warning, notice, info, or debug."
+    if priority is not None and (
+        not isinstance(priority, int)
+        or isinstance(priority, bool)
+        or not -32_768 <= priority <= 32_767
+    ):
+        return None, "priority must be an integer from -32768 through 32767, or omitted."
+
+    def normalize_cidr(value: object, field: str) -> tuple[str | None, str | None]:
+        if value is None or value == "":
+            return None, None
+        if not isinstance(value, str) or len(value) > 64:
+            return None, f"{field} must be a canonical IPv4/IPv6 address or CIDR, or empty."
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError:
+            return None, f"{field} must use canonical IP address or network notation."
+        if str(network) != value:
+            return None, f"{field} must use canonical IP address or network notation."
+        return str(network), None
+
+    normalized_source, error = normalize_cidr(source_cidr, "source_cidr")
+    if error:
+        return None, error
+    normalized_destination, error = normalize_cidr(destination_cidr, "destination_cidr")
+    if error:
+        return None, error
+    families = {
+        "ipv6" if ":" in value else "ipv4"
+        for value in (normalized_source, normalized_destination)
+        if value is not None
+    }
+    if len(families) > 1:
+        return None, "source_cidr and destination_cidr must use the same IP version."
+
+    family_clause = f' family="{next(iter(families))}"' if families else ""
+    priority_clause = f' priority="{priority}"' if priority is not None else ""
+    source_clause = f' source address="{normalized_source}"' if normalized_source else ""
+    destination_clause = (
+        f' destination address="{normalized_destination}"' if normalized_destination else ""
+    )
+    log_clause = ""
+    if log_enabled:
+        attributes = ""
+        if log_prefix is not None:
+            attributes += f' prefix="{log_prefix}"'
+        if log_level is not None:
+            attributes += f' level="{log_level}"'
+        log_clause = f" log{attributes} limit value=\"1/m\""
+    audit_clause = ' audit limit value="1/m"' if audit_enabled else ""
+    rich_rule = (
+        f'rule{family_clause}{priority_clause}{source_clause}{destination_clause} '
+        f'protocol value="{protocol_number}"{log_clause}{audit_clause} {verdict}'
+    )
+    return (
+        (
+            action, configuration, zone, normalized_protocol, protocol_number,
+            normalized_source, normalized_destination, verdict, log_enabled,
+            log_prefix if isinstance(log_prefix, str) else None, log_level,
+            audit_enabled, priority, rich_rule,
+        ),
+        None,
+    )
+
+
+def _read_rule_snapshot(
+    configuration: str,
+    zone: str,
+    rich_rule: str,
+    binary: str,
+    env: dict[str, str],
+) -> tuple[_RuleSnapshot | None, str | None]:
+    snapshot, error = _read_snapshot(configuration, zone, rich_rule, binary, env)
+    if error or snapshot is None:
+        return None, error or "The exact firewalld rich-rule state could not be verified."
+    return _RuleSnapshot(snapshot.zone_active, snapshot.matching_count), None
+
+
+def firewalld_rich_protocol_rule_confirmation_details(
+    action: str,
+    configuration: str,
+    zone: str,
+    protocol_value: str,
+    source_cidr: str | None = None,
+    destination_cidr: str | None = None,
+    verdict: str = "accept",
+    log_enabled: bool = False,
+    log_prefix: str | None = None,
+    log_level: str | None = None,
+    audit_enabled: bool = False,
+    priority: int | None = None,
+) -> tuple[FirewalldRichProtocolRuleTarget | None, str | None]:
+    request, error = _normalize_request(
+        action, configuration, zone, protocol_value, source_cidr,
+        destination_cidr, verdict, log_enabled, log_prefix, log_level,
+        audit_enabled, priority,
+    )
+    if error or request is None:
+        return None, error or "The rich protocol rule request is invalid."
+    (
+        action, configuration, zone, normalized_protocol, protocol_number,
+        source_cidr, destination_cidr, verdict, log_enabled, log_prefix,
+        log_level, audit_enabled, priority, rich_rule,
+    ) = request
+    env = _environment()
+    binary = _binary(env)
+    if not binary:
+        return None, "The optional firewall-cmd tool is unavailable on this Linux host."
+    snapshot, error = _read_rule_snapshot(configuration, zone, rich_rule, binary, env)
+    if error or snapshot is None:
+        return None, error or "The exact rich protocol rule state could not be verified."
+    desired_count = 0 if action == "add" else 1
+    if snapshot.matching_count != desired_count:
+        return None, (
+            "That exact rich protocol rule already exists in the selected configuration."
+            if snapshot.matching_count
+            else "That exact rich protocol rule is not present in the selected configuration."
+        )
+    token = secrets.token_urlsafe(32)
+    now = time.monotonic()
+    with ACTION_LOCK:
+        for key in [key for key, item in _TOKENS.items() if item.expires_at <= now]:
+            _TOKENS.pop(key, None)
+        if len(_TOKENS) >= MAX_PENDING_TOKENS:
+            return None, "Too many pending firewalld confirmations; retry after existing prompts expire."
+        _TOKENS[token] = _RuleToken(
+            request=request,
+            zone_active=snapshot.zone_active,
+            matching_count=snapshot.matching_count,
+            rich_rule=rich_rule,
+            protocol_number=protocol_number,
+            expires_at=now + TOKEN_TTL_SECONDS,
+        )
+    return FirewalldRichProtocolRuleTarget(
+        action=action,
+        configuration=configuration,
+        zone=zone,
+        protocol_value=normalized_protocol,
+        protocol_number=protocol_number,
+        source_cidr=source_cidr,
+        destination_cidr=destination_cidr,
+        verdict=verdict,
+        log_enabled=log_enabled,
+        log_prefix=log_prefix,
+        log_level=log_level,
+        audit_enabled=audit_enabled,
+        priority=priority,
+        zone_active=snapshot.zone_active,
+        rich_rule=rich_rule,
+        matching_count=snapshot.matching_count,
+        confirmation_token=token,
+    ), None
+
+
+def _response(
+    *, success: bool, action: object, configuration: object, zone: object,
+    protocol_value: object, protocol_number: object, source_cidr: object,
+    destination_cidr: object, verdict: object, rich_rule: object,
+    rule_present: bool | None, state_verified: bool, user_confirmed: bool,
+    message: str,
+) -> FirewalldRichProtocolRuleActionResponse:
+    return FirewalldRichProtocolRuleActionResponse(
+        success=success,
+        action=action if action in {"add", "remove"} else "add",
+        configuration=configuration if configuration in {"runtime", "permanent"} else "runtime",
+        zone=zone[:64] if isinstance(zone, str) else None,
+        protocol_value=protocol_value[:64] if isinstance(protocol_value, str) else None,
+        protocol_number=protocol_number if isinstance(protocol_number, int) and 0 <= protocol_number <= 255 else None,
+        source_cidr=source_cidr[:64] if isinstance(source_cidr, str) else None,
+        destination_cidr=destination_cidr[:64] if isinstance(destination_cidr, str) else None,
+        verdict=verdict if verdict in {"accept", "reject", "drop"} else None,
+        rich_rule=rich_rule[:2_048] if isinstance(rich_rule, str) else None,
+        rule_present=rule_present,
+        state_verified=state_verified,
+        user_confirmed=user_confirmed,
+        message=message,
+    )
+
+
+def perform_firewalld_rich_protocol_rule_action(
+    action: str,
+    configuration: str,
+    zone: str,
+    protocol_value: str,
+    source_cidr: str | None,
+    destination_cidr: str | None,
+    verdict: str,
+    log_enabled: bool,
+    log_prefix: str | None,
+    log_level: str | None,
+    audit_enabled: bool,
+    priority: int | None,
+    expected_state_token: str,
+    *,
+    confirmed: bool,
+) -> FirewalldRichProtocolRuleActionResponse:
+    with ACTION_LOCK:
+        token = (
+            expected_state_token
+            if isinstance(expected_state_token, str)
+            and len(expected_state_token) <= 100
+            and TOKEN_RE.fullmatch(expected_state_token)
+            else None
+        )
+        record = _TOKENS.get(token) if token else None
+        if record is None or record.expires_at <= time.monotonic():
+            if token:
+                _TOKENS.pop(token, None)
+            return _response(
+                success=False, action=action, configuration=configuration, zone=zone,
+                protocol_value=protocol_value, protocol_number=None,
+                source_cidr=source_cidr, destination_cidr=destination_cidr,
+                verdict=verdict, rich_rule=None, rule_present=None,
+                state_verified=False, user_confirmed=confirmed is True,
+                message="A fresh firewalld confirmation token is required; inspect the exact rich protocol rule and try again.",
+            )
+        if record.claimed:
+            return _response(
+                success=False, action=action, configuration=configuration, zone=zone,
+                protocol_value=protocol_value, protocol_number=record.protocol_number,
+                source_cidr=source_cidr, destination_cidr=destination_cidr,
+                verdict=verdict, rich_rule=record.rich_rule,
+                rule_present=record.matching_count == 1, state_verified=False,
+                user_confirmed=confirmed is True,
+                message="This firewalld confirmation token is already in use; request a fresh confirmation.",
+            )
+        record.claimed = True
+
+    try:
+        request, error = _normalize_request(
+            action, configuration, zone, protocol_value, source_cidr,
+            destination_cidr, verdict, log_enabled, log_prefix, log_level,
+            audit_enabled, priority,
+        )
+        if confirmed is not True:
+            error = "Explicit client confirmation is required; no firewalld command was run."
+        elif error or request != record.request:
+            error = error or "Confirmation did not match the exact rich protocol rule and modifiers; no command was run."
+        if error:
+            r = record.request
+            return _response(
+                success=False, action=r[0], configuration=r[1], zone=r[2],
+                protocol_value=r[3], protocol_number=r[4], source_cidr=r[5],
+                destination_cidr=r[6], verdict=r[7], rich_rule=record.rich_rule,
+                rule_present=record.matching_count == 1, state_verified=False,
+                user_confirmed=confirmed is True, message=error,
+            )
+        env = _environment()
+        binary = _binary(env)
+        if not binary:
+            r = record.request
+            return _response(
+                success=False, action=r[0], configuration=r[1], zone=r[2],
+                protocol_value=r[3], protocol_number=r[4], source_cidr=r[5],
+                destination_cidr=r[6], verdict=r[7], rich_rule=record.rich_rule,
+                rule_present=record.matching_count == 1, state_verified=False,
+                user_confirmed=True, message="The optional firewall-cmd tool became unavailable; no firewall command was run.",
+            )
+        r = record.request
+        current, error = _read_rule_snapshot(r[1], r[2], record.rich_rule, binary, env)
+        if error or current is None:
+            return _response(
+                success=False, action=r[0], configuration=r[1], zone=r[2],
+                protocol_value=r[3], protocol_number=r[4], source_cidr=r[5],
+                destination_cidr=r[6], verdict=r[7], rich_rule=record.rich_rule,
+                rule_present=None, state_verified=False, user_confirmed=True,
+                message=error or "The firewalld state could not be revalidated; no command was run.",
+            )
+        if current.zone_active != record.zone_active or current.matching_count != record.matching_count:
+            return _response(
+                success=False, action=r[0], configuration=r[1], zone=r[2],
+                protocol_value=r[3], protocol_number=r[4], source_cidr=r[5],
+                destination_cidr=r[6], verdict=r[7], rich_rule=record.rich_rule,
+                rule_present=current.matching_count == 1, state_verified=False,
+                user_confirmed=True,
+                message="The zone binding or rich-rule list changed after confirmation; inspect it and confirm again.",
+            )
+        command_name = "--add-rich-rule" if action == "add" else "--remove-rich-rule"
+        arguments = [f"--zone={zone}", f"{command_name}={record.rich_rule}"]
+        if configuration == "permanent":
+            arguments.insert(0, "--permanent")
+        _output, command_error, command_truncated = _command(
+            binary, arguments, env, label=f"firewalld {configuration} rich protocol rule update",
+        )
+        after, verify_error = _read_rule_snapshot(configuration, zone, record.rich_rule, binary, env)
+        expected_present = action == "add"
+        verified = (
+            after is not None
+            and after.zone_active == record.zone_active
+            and (after.matching_count == 1) is expected_present
+        )
+        if command_error or command_truncated or not verified:
+            message = (
+                "The firewalld command timed out; inspect the selected configuration before retrying."
+                if command_error and "timed out" in command_error.casefold()
+                else "Firewalld reported a rich protocol rule update error; inspect the selected configuration before retrying."
+                if command_error or command_truncated
+                else "Firewalld returned from the update, but the exact rich protocol rule state is not visible."
+            )
+            if verified:
+                message += " The requested rule state is visible."
+            elif verify_error:
+                message += " The resulting state could not be verified."
+            return _response(
+                success=False, action=action, configuration=configuration, zone=zone,
+                protocol_value=r[3], protocol_number=r[4], source_cidr=r[5],
+                destination_cidr=r[6], verdict=r[7], rich_rule=record.rich_rule,
+                rule_present=(after.matching_count == 1) if after is not None else None,
+                state_verified=verified, user_confirmed=True, message=message,
+            )
+        persistence = (
+            "This runtime-only change lasts until firewalld reloads, restarts, or the host reboots."
+            if configuration == "runtime"
+            else "This changes saved configuration only; runtime rules change after a firewalld reload or restart."
+        )
+        effect = "added" if expected_present else "removed"
+        return _response(
+            success=True, action=action, configuration=configuration, zone=zone,
+            protocol_value=r[3], protocol_number=r[4], source_cidr=r[5],
+            destination_cidr=r[6], verdict=r[7], rich_rule=record.rich_rule,
+            rule_present=after.matching_count == 1, state_verified=True,
+            user_confirmed=True,
+            message=f"The exact firewalld rich protocol rule was {effect} in zone {zone}. {persistence}",
+        )
+    finally:
+        with ACTION_LOCK:
+            _TOKENS.pop(expected_state_token, None)

@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.linux_mcp
+Exec=@CMAKE_INSTALL_FULL_LIBEXECDIR@/linux-mcp-portal
+SystemdService=linux-mcp-portal.service
