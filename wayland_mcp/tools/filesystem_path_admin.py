@@ -1070,7 +1070,26 @@ def manage_posix_acl(
             os.removexattr(target_fd, attr_name)
         after, error = _read_xattr(target_fd, attr_name)
         if action == "set" and (error or after != prepared.raw_value):
-            raise OSError(error or "The stored ACL did not match the request.")
+            # Linux may represent a three-entry access ACL entirely in the
+            # inode mode bits and omit the equivalent ACL xattr.
+            simple_access_acl = (
+                acl_kind == "access"
+                and after is None
+                and len(prepared.entries) == 3
+                and {entry.tag for entry in prepared.entries} == {"user_obj", "group_obj", "other"}
+            )
+            if simple_access_acl:
+                requested_mode = 0
+                for entry in prepared.entries:
+                    permissions = sum(
+                        bit for char, bit in zip(entry.permissions, (4, 2, 1)) if char != "-"
+                    )
+                    requested_mode |= permissions << {"user_obj": 6, "group_obj": 3, "other": 0}[entry.tag]
+                resulting_mode = stat.S_IMODE(os.fstat(target_fd).st_mode) & 0o777
+                if error or resulting_mode != requested_mode:
+                    raise OSError(error or "The resulting mode did not match the requested access ACL.")
+            else:
+                raise OSError(error or "The stored ACL did not match the request.")
         if action == "remove" and (error or after is not None):
             raise OSError(error or "The ACL remains present after removal.")
         return PathAdminResponse(success=True, path=str(prepared.path), action=action, acl_kind=acl_kind, acl_entry_count=len(prepared.entries), attribute_name=attr_name, value_sha256=hashlib.sha256(prepared.raw_value).hexdigest() if prepared.raw_value is not None else None, user_confirmed=True, message="The POSIX ACL was changed and verified.")

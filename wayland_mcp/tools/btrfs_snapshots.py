@@ -29,9 +29,9 @@ ACTION_TIMEOUT_SECONDS = 180
 MOUNTINFO = Path("/proc/self/mountinfo")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SUBVOLUME_LINE_RE = re.compile(
-    r"^ID (?P<id>[0-9]+) gen (?P<generation>[0-9]+) parent (?P<parent_id>[0-9]+) "
-    r"top level (?P<top_level_id>[0-9]+) parent_uuid (?P<parent_uuid>\S+) "
-    r"received_uuid (?P<received_uuid>\S+) uuid (?P<uuid>\S+) path (?P<path>.*)$"
+    r"^ID\s+(?P<id>[0-9]+)\s+gen\s+(?P<generation>[0-9]+)\s+parent\s+(?P<parent_id>[0-9]+)\s+"
+    r"top\s+level\s+(?P<top_level_id>[0-9]+)\s+parent_uuid\s+(?P<parent_uuid>\S+)\s+"
+    r"received_uuid\s+(?P<received_uuid>\S+)\s+uuid\s+(?P<uuid>\S+)\s+path\s+(?P<path>.*)$"
 )
 
 
@@ -430,6 +430,47 @@ def _decode_mount_field(value: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
 
 
+def _mount_entry_for_path(path: Path, mountinfo: str) -> tuple[int, str] | None:
+    selected: tuple[tuple[int, int], int, str] | None = None
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if len(fields) < 7:
+            return None
+        try:
+            separator = fields.index("-")
+            mount_id = int(fields[0], 10)
+            mount_point = Path(_decode_mount_field(fields[4]))
+        except (ValueError, IndexError):
+            return None
+        if mount_id <= 0 or len(fields) <= separator + 1:
+            return None
+        if not path.is_relative_to(mount_point):
+            continue
+        rank = (len(mount_point.parts), mount_id)
+        entry = (rank, mount_id, fields[separator + 1])
+        if selected is None or rank > selected[0]:
+            selected = entry
+    if selected is None:
+        return None
+    return selected[1], selected[2]
+
+
+def _same_btrfs_mount(root: Path, path: Path) -> bool | None:
+    try:
+        with MOUNTINFO.open("rb") as stream:
+            data = stream.read(MAX_PROC_MOUNTINFO_BYTES + 1)
+        if len(data) > MAX_PROC_MOUNTINFO_BYTES:
+            return None
+        text = data.decode("utf-8", errors="strict")
+    except (OSError, UnicodeError):
+        return None
+    root_entry = _mount_entry_for_path(root, text)
+    path_entry = _mount_entry_for_path(path, text)
+    if root_entry is None or path_entry is None:
+        return None
+    return root_entry[1] == "btrfs" and path_entry[1] == "btrfs" and root_entry[0] == path_entry[0]
+
+
 def _snapshot_is_mounted(root: Path, snapshot: BtrfsSubvolume) -> bool | None:
     try:
         with MOUNTINFO.open("rb") as stream:
@@ -597,8 +638,18 @@ def _restore_state_error(
         or root_identity[:2] != target.filesystem_top_level_identity[:2]
     ):
         return error or "The Btrfs filesystem top-level identity changed."
+    same_mount_paths = [snapshot.path, restore_target.path, restore_target.path.parent]
+    if staged_expected is not None:
+        same_mount_paths.append(stage_path)
+    if any(_same_btrfs_mount(root, path) is not True for path in same_mount_paths):
+        return "The restore paths no longer share the selected mounted Btrfs filesystem."
     snapshot_now, error = _subvolume_from_path(snapshot.path, snapshot.relative_path)
-    if error or not _same_subvolume_state(snapshot_now, snapshot):
+    snapshot_matches = (
+        _same_subvolume_identity(snapshot_now, snapshot)
+        if staged_expected is not None
+        else _same_subvolume_state(snapshot_now, snapshot)
+    )
+    if error or not snapshot_matches:
         return error or "The read-only restore snapshot changed after confirmation."
     target_now, error = _subvolume_from_path(restore_target.path, restore_target.relative_path)
     if error or not _same_subvolume_state(target_now, restore_target):
@@ -687,7 +738,7 @@ def btrfs_snapshot_action_confirmation_details(
         if source_relative is None:
             return None, None, "The snapshot source must be beneath the selected Btrfs top-level path."
         source_identity = _stat_identity(source_path_value)
-        if source_identity is None or source_identity[0] != root_identity[0]:
+        if source_identity is None or _same_btrfs_mount(root, source_path_value) is not True:
             return None, None, "The snapshot source must be a directory on the selected Btrfs filesystem."
         source, error = _subvolume_from_path(source_path_value, source_relative)
         if error or source is None:
@@ -707,7 +758,7 @@ def btrfs_snapshot_action_confirmation_details(
         if os.path.lexists(destination):
             return None, None, "The snapshot destination already exists; no path will be overwritten."
         destination_parent_identity = _stat_identity(destination.parent)
-        if destination_parent_identity is None or destination_parent_identity[0] != root_identity[0]:
+        if destination_parent_identity is None or _same_btrfs_mount(root, destination.parent) is not True:
             return None, None, "The snapshot destination parent must be an existing directory on the selected Btrfs filesystem."
         if not os.access(destination.parent, os.W_OK | os.X_OK):
             return None, None, "The current OS identity cannot write to the snapshot destination parent."
@@ -722,7 +773,7 @@ def btrfs_snapshot_action_confirmation_details(
         if not snapshot_relative:
             return None, None, "The filesystem top-level subvolume cannot be deleted."
         snapshot_identity = _stat_identity(destination)
-        if snapshot_identity is None or snapshot_identity[0] != root_identity[0]:
+        if snapshot_identity is None or _same_btrfs_mount(root, destination) is not True:
             return None, None, "The selected snapshot must be a directory on the selected Btrfs filesystem."
         snapshot, error = _subvolume_from_path(destination, snapshot_relative)
         if error or snapshot is None:
@@ -761,7 +812,7 @@ def btrfs_snapshot_action_confirmation_details(
         if not snapshot_relative:
             return None, None, "The filesystem top-level subvolume cannot be restored as a snapshot."
         snapshot_identity = _stat_identity(destination)
-        if snapshot_identity is None or snapshot_identity[0] != root_identity[0]:
+        if snapshot_identity is None or _same_btrfs_mount(root, destination) is not True:
             return None, None, "The selected restore source must be a subvolume on the selected Btrfs filesystem."
         snapshot, error = _subvolume_from_path(destination, snapshot_relative)
         if error or snapshot is None:
@@ -780,7 +831,7 @@ def btrfs_snapshot_action_confirmation_details(
         if not target_relative:
             return None, None, "The filesystem top-level subvolume cannot be replaced."
         target_identity = _stat_identity(restore_target_path)
-        if target_identity is None or target_identity[0] != root_identity[0]:
+        if target_identity is None or _same_btrfs_mount(root, restore_target_path) is not True:
             return None, None, "The target must be a subvolume on the selected Btrfs filesystem."
         restore_target, error = _subvolume_from_path(restore_target_path, target_relative)
         if error or restore_target is None:
@@ -807,7 +858,7 @@ def btrfs_snapshot_action_confirmation_details(
         if (name_error := _validate_destination_name(restore_backup_path)):
             return None, None, name_error
         restore_parent_identity = _stat_identity(restore_target_path.parent)
-        if restore_parent_identity is None or restore_parent_identity[0] != root_identity[0]:
+        if restore_parent_identity is None or _same_btrfs_mount(root, restore_target_path.parent) is not True:
             return None, None, "The target and backup parent must be an accessible directory on the selected Btrfs filesystem."
         if not os.access(restore_target_path.parent, os.W_OK | os.X_OK):
             return None, None, "The current OS identity cannot replace the target in its parent directory."
