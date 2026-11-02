@@ -1997,7 +1997,7 @@ class SystemdServiceDefinitionConfirmation(BaseModel):
     scope: Literal["system", "user"]
     unit: str = Field(description="Repeat the exact .service unit name")
     executable: str = Field(description="Repeat the exact canonical absolute executable path")
-    arguments: List[str] = Field(default_factory=list, description="Repeat the exact argument vector; arguments are passed directly without a shell")
+    arguments_json: str = Field(description="Repeat the exact argument vector as a compact JSON array of strings; arguments are passed directly without a shell")
     confirmation_phrase: str = Field(description="Repeat the exact confirmation phrase shown in the prompt")
     expected_state_token: str = Field(
         pattern=r"^[0-9a-f]{64}$",
@@ -4457,7 +4457,7 @@ class TPMEventLogResponse(BaseModel):
 class TPMAttestationConfirmation(BaseModel):
     confirm: bool = Field(description="Confirm this TPM quote request")
     persistent_handle: str = Field(pattern=r"^0x81[0-9a-fA-F]{6}$", description="Repeat the exact persistent TPM attestation-key handle")
-    pcr_indices: List[int] = Field(min_length=1, max_length=24, description="Repeat the selected unique PCR indexes from 0 through 23")
+    pcr_indices_json: str = Field(description="Repeat the selected unique PCR indexes as a compact JSON array of integers from 0 through 23")
     nonce: str = Field(pattern=r"^[0-9a-f]{64}$", description="Repeat the caller-supplied 32-byte verifier nonce")
     state_token: str = Field(pattern=r"^[0-9a-f]{64}$", description="Repeat the token bound to the public key, TPM device, tools, nonce, and PCR selection")
 
@@ -5267,7 +5267,7 @@ class UFWPortRuleActionConfirmation(BaseModel):
     protocol: Literal["tcp", "udp"]
     port: int = Field(description="Repeat the first destination port shown in the prompt")
     port_end: Optional[int] = Field(default=None, description="Repeat the inclusive last destination port for a range, or null for one port")
-    additional_ports: Optional[List[StrictInt]] = Field(default=None, description="Repeat remaining destination ports in strictly increasing order for a numeric list of at most 15 total ports, or null for one port or a range")
+    additional_ports_json: str = Field(description="Repeat remaining destination ports as a compact JSON array of integers; use [] for one port or a range")
     direction: Literal["in", "out"] = Field(description="Repeat inbound or outbound direction")
     source_address: str = Field(description="Repeat the exact source IP or CIDR shown in the prompt")
     destination_address: str = Field(description="Repeat the exact destination IP or CIDR shown in the prompt")

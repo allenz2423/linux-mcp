@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+from typing import get_args, get_type_hints
 
 import pytest
+from mcp.server.elicitation import render_elicitation_schema
 
+from wayland_mcp import server as server_module
 from wayland_mcp.server import _parse_startup_selection, create_server
 from wayland_mcp.tool_config import TOOL_CATEGORIES, TOOL_CATEGORY_MEMBERSHIPS, ToolSelection
 
@@ -86,3 +90,18 @@ def test_python_environment_create_confirmation_accepts_empty_optional_fields() 
 
     assert confirmation.package_name == ""
     assert confirmation.version == ""
+
+
+def test_all_confirmation_models_render_supported_mcp_elicitation_schemas() -> None:
+    confirmation_models = set()
+    for name, function in vars(server_module).items():
+        if not name.startswith("_confirm_") or not inspect.isfunction(function):
+            continue
+        return_annotation = get_type_hints(function).get("return")
+        model_arguments = get_args(return_annotation)
+        assert len(model_arguments) == 1, f"{name} must return one typed elicitation model"
+        confirmation_models.add(model_arguments[0])
+
+    assert len(confirmation_models) >= 100
+    for model in confirmation_models:
+        render_elicitation_schema(model)

@@ -1257,9 +1257,11 @@ async def _confirm_systemd_service_definition(
         if scope == "system"
         else " The command runs as the current user through that user's systemd manager."
     )
+    arguments_json = json.dumps(list(target.arguments), ensure_ascii=True, separators=(",", ":"))
     return Elicit(
         f"Confirm {action} of generated one-shot service {target.unit!r} in {target.scope} scope at {str(target.path)!r}? "
-        f"Exact argv vector: {argv_text}. The tool passes these values directly to ExecStart without a shell; "
+        f"Exact argv vector: {argv_text}. Confirmation arguments_json: {arguments_json}. "
+        "The tool passes these values directly to ExecStart without a shell; "
         "the executable and arguments will be stored in readable unit-file text, so do not include secrets. "
         "The service uses Type=oneshot and an enableable default.target installation section. "
         "The server writes only this generated .service file and reloads the selected systemd manager; it does not start or enable the service, "
@@ -2091,6 +2093,7 @@ async def _confirm_tpm_attestation(
     if validation_error or target is None:
         raise ValueError(validation_error or "The persistent TPM key could not be verified.")
     pcr_list = ", ".join(str(index) for index in target.pcr_indices)
+    pcr_indices_json = json.dumps(list(target.pcr_indices), separators=(",", ":"))
     public_fingerprint = hashlib.sha256(target.public_key_pem).hexdigest()
     return Elicit(
         f"Request a TPM 2.0 quote from persistent key {target.persistent_handle} for SHA-256 PCRs [{pcr_list}] "
@@ -2098,7 +2101,7 @@ async def _confirm_tpm_attestation(
         f"The key's public-key SHA-256 fingerprint is {public_fingerprint}. The tool locally checks the signature, nonce, "
         "and included PCR values; it does not establish trust in this key or decide whether measurements are acceptable. "
         "Keys that require a secret authorization value are not supported. The server does not send the quote to a verifier; "
-        "the artifacts are returned to this MCP client. Repeat the exact handle, PCR indexes, nonce, and state token. "
+        f"the artifacts are returned to this MCP client. Repeat the exact handle, PCR indexes JSON {pcr_indices_json}, nonce, and state token. "
         f"State token: {target.state_token}.",
         TPMAttestationConfirmation,
     )
@@ -5501,6 +5504,7 @@ async def _confirm_ufw_port_rule_action(
         if effect == "remove"
         else "none yet"
     )
+    additional_ports_json = json.dumps(list(target.additional_ports or ()), separators=(",", ":"))
     port_label = (
         ", ".join(str(item) for item in (target.port, *target.additional_ports))
         if target.additional_ports
@@ -5511,7 +5515,8 @@ async def _confirm_ufw_port_rule_action(
         f"Confirm UFW {effect} {policy} for {target.direction} {target.protocol.upper()} destination port selector {port_label}, "
         f"source {target.source_address}, destination {target.destination_address}, on all UFW-managed interfaces? Existing matching {policy} entries: "
         f"IPv4={target.ipv4_count}, IPv6={target.ipv6_count}; numbered entries to remove: {numbered_entries}. "
-        f"Matching entries for other UFW actions: {other_count}. State token: {target.confirmation_token}. "
+        f"Matching entries for other UFW actions: {other_count}. additional_ports_json: {additional_ports_json}. "
+        f"State token: {target.confirmation_token}. "
         "A removal re-reads the numbered list between IPv4 and IPv6 entries because UFW renumbers after deletion. "
         f"{change_effect} When both addresses are 'any' and IPv6 is enabled, "
         "the rule may apply to both IPv4 and IPv6. Earlier rules may take "
@@ -8313,6 +8318,7 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
         data = confirmation.data
         expected_source, source_error = _canonical_ufw_address(source_address, field="source_address")
         expected_destination, destination_error = _canonical_ufw_address(destination_address, field="destination_address")
+        expected_additional_ports_json = json.dumps(list(additional_ports or ()), separators=(",", ":"))
         if (
             source_error is not None
             or destination_error is not None
@@ -8320,7 +8326,7 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
             or data.protocol != protocol
             or data.port != port
             or data.port_end != port_end
-            or tuple(data.additional_ports or ()) != tuple(additional_ports or ())
+            or data.additional_ports_json != expected_additional_ports_json
             or data.direction != direction
             or data.source_address != expected_source
             or data.destination_address != expected_destination
@@ -8567,12 +8573,13 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
                 **perform_args,
                 confirmed=False,
             )
+        expected_arguments_json = json.dumps(arguments, ensure_ascii=True, separators=(",", ":"))
         if (
             data.action != action
             or data.scope != scope
             or data.unit != unit
             or data.executable != executable
-            or data.arguments != arguments
+            or data.arguments_json != expected_arguments_json
         ):
             return SystemdServiceDefinitionResponse(
                 success=False,
@@ -8592,7 +8599,7 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
             confirmed_scope=data.scope,
             confirmed_unit=data.unit,
             confirmed_executable=data.executable,
-            confirmed_arguments=data.arguments,
+            confirmed_arguments=arguments,
             confirmed_phrase=data.confirmation_phrase,
             expected_state_token=data.expected_state_token,
         )
@@ -10881,6 +10888,16 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
                 message=f"TPM attestation request was {confirmation.action}; no quote was requested.",
             )
         data = confirmation.data
+        expected_pcr_indices_json = json.dumps(pcr_indices, separators=(",", ":"))
+        if data.pcr_indices_json != expected_pcr_indices_json:
+            return TPMAttestationResponse(
+                success=False,
+                persistent_handle=persistent_handle.lower(),
+                pcr_indices=pcr_indices,
+                nonce=nonce,
+                user_confirmed=False,
+                message="Confirmation did not repeat the exact PCR selection as a JSON array; no quote was requested.",
+            )
         return await asyncio.to_thread(
             _perform_tpm_attestation,
             persistent_handle=persistent_handle,
@@ -10888,7 +10905,7 @@ def create_server(tool_selection: ToolSelection | None = None) -> MCPServer:
             nonce=nonce,
             confirmed=data.confirm is True,
             confirmed_handle=data.persistent_handle,
-            confirmed_pcr_indices=data.pcr_indices,
+            confirmed_pcr_indices=pcr_indices,
             confirmed_nonce=data.nonce,
             state_token=data.state_token,
         )
