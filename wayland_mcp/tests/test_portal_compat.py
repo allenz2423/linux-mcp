@@ -384,9 +384,15 @@ async def test_startup_falls_back_when_touchscreen_device_type_is_unsupported(mo
         def __init__(self):
             self.sessions = []
 
+        async def call_create_session(self, _options):
+            return "screen-create"
+
         async def call_select_sources(self, session, _options):
             self.sessions.append(session)
-            return f"sources-{session.rsplit('/', 1)[-1]}"
+            return "screen-sources"
+
+        async def call_start(self, _session, _parent, _options):
+            return "screen-start"
 
     remote = Remote()
     screencast = ScreenCast()
@@ -398,12 +404,15 @@ async def test_startup_falls_back_when_touchscreen_device_type_is_unsupported(mo
         if request_path.startswith("create-"):
             index = int(request_path.rsplit("-", 1)[-1])
             return {"session_handle": f"/org/freedesktop/portal/desktop/session/session{index}"}
+        if request_path == "screen-create":
+            return {"session_handle": "/org/freedesktop/portal/desktop/session/screen"}
         if request_path == "devices-7":
             raise PortalError("The desktop portal rejected the request. unsupported device type requested")
-        if request_path.startswith("start-"):
+        if request_path == "start-1":
+            return {"devices": 3}
+        if request_path == "screen-start":
             return {
-                "devices": 3,
-                "streams": [(42, {
+                "streams": [(84, {
                     "position": (0, 0),
                     "logical_size": (1920, 1080),
                     "source_type": 1,
@@ -425,7 +434,8 @@ async def test_startup_falls_back_when_touchscreen_device_type_is_unsupported(mo
     assert remote.device_types == [7, 3]
     assert remote.create_calls == 2
     assert remote.start_calls == 1
-    assert screencast.sessions == ["/org/freedesktop/portal/desktop/session/session2"]
+    assert screencast.sessions == ["/org/freedesktop/portal/desktop/session/screen"]
+    assert portal.startup_capability_state()["monitor_stream"] is True
     with pytest.raises(PortalError, match="No matching touchscreen/monitor permission"):
         await portal.ensure_touch_session()
     assert remote.create_calls == 2

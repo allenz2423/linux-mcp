@@ -474,12 +474,12 @@ class RemoteDesktopPortal(_PortalBus):
                 # Retry with all supported features while staying inside the
                 # startup flow; tool calls never retry permission requests.
                 logger.info("The portal does not support startup touchscreen permission; retrying keyboard and pointer only.")
-                try:
-                    session, started, screencast = await create_session(3)
-                except _PortalScreenCastSetupError as screen_error:
-                    logger.info("The portal cannot combine ScreenCast with startup RemoteDesktop: %s", str(screen_error))
-                    use_separate_screencast = True
-                    session, started, screencast = await create_session(3, include_screencast=False)
+                # Keep ScreenCast in its own session after this backend rejects
+                # touchscreen. Some desktops route RemoteDesktop and ScreenCast
+                # to different portal implementations; probing the combined
+                # session on those backends can crash the ScreenCast service.
+                use_separate_screencast = True
+                session, started, screencast = await create_session(3, include_screencast=False)
 
             granted_devices = int(started.get("devices", 0) or 0)
             if not granted_devices & 7:
