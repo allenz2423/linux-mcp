@@ -13,6 +13,7 @@ from typing import Annotated, Literal
 from pydantic import Field as PydanticField, SecretStr, StrictInt
 
 from mcp.server.mcpserver import Elicit, ElicitationResult, Image, MCPServer, Resolve
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from wayland_mcp.models import (
@@ -2061,7 +2062,7 @@ async def _confirm_kernel_command_line_change(
 async def _confirm_initramfs_rebuild() -> Elicit[InitramfsRebuildConfirmation]:
     target, validation_error = await asyncio.to_thread(_initramfs_rebuild_confirmation_details)
     if validation_error or target is None:
-        raise ValueError(validation_error or "The current initramfs target could not be verified.")
+        raise ToolError(validation_error or "The current initramfs target could not be verified.")
     mkinitcpio_details = (
         f" For mkinitcpio, the selected literal preset resolves to direct arguments {target.command_arguments!r}; "
         f"it uses config {target.config_path} and "
