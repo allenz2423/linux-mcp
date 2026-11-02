@@ -216,6 +216,35 @@ def _expected_state(action: TimerAction, snapshot: SystemdTimerSnapshot) -> bool
     return snapshot.unit_file_state in {"disabled", "static"}
 
 
+def _action_result_message(
+    action: TimerAction,
+    before: SystemdTimerSnapshot,
+) -> str:
+    if action == "start":
+        return (
+            "Timer was already active; no state change was needed and the active state was verified."
+            if before.active_state == "active"
+            else "Timer activation was changed and verified."
+        )
+    if action == "stop":
+        return (
+            "Timer was already inactive; no state change was needed. An already-triggered service is not stopped by this action."
+            if before.active_state == "inactive"
+            else "Timer deactivation was changed and verified; an already-triggered service is not stopped by this action."
+        )
+    if action == "enable":
+        return (
+            "Timer was already enabled; no change was needed and enablement was verified. The timer was not started by this action."
+            if before.unit_file_state == "enabled"
+            else "Persistent timer enablement was changed and verified; the timer was not started by this action."
+        )
+    return (
+        "Timer was already disabled; no enablement change was needed. An active timer was not stopped by this action."
+        if before.unit_file_state == "disabled"
+        else "Persistent timer enablement was removed and verified; an active timer was not stopped by this action."
+    )
+
+
 def _response(
     action: TimerAction,
     unit: str,
@@ -329,13 +358,7 @@ def perform_systemd_timer_action(
             verified=False,
             message="The action completed, but the requested timer state was not observed. Inspect timer state before retrying.",
         )
-    effects = {
-        "start": "Timer activation was changed and verified.",
-        "stop": "Timer deactivation was changed and verified; an already-triggered service is not stopped by this action.",
-        "enable": "Persistent timer enablement was changed and verified; the timer was not started by this action.",
-        "disable": "Persistent timer enablement was removed and verified; an active timer was not stopped by this action.",
-    }
     return _response(
         safe_action, safe_unit, safe_scope, confirmed=True, snapshot=after, success=True,
-        verified=True, message=effects[safe_action],
+        verified=True, message=_action_result_message(safe_action, snapshot),
     )
