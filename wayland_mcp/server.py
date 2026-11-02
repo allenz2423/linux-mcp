@@ -4410,6 +4410,24 @@ async def _confirm_radio_device_action(
         action,
         identity_token,
     )
+    if validation_error or target is None:
+        raise ValueError(validation_error or "The exact rfkill device could not be verified.")
+    effect = (
+        " This turns off the selected radio and may interrupt Wi-Fi, Bluetooth, WWAN, or this MCP connection."
+        if action == "block"
+        else " This enables the software radio state but does not connect to a network; a network manager may react."
+    )
+    current = "soft-blocked" if target.soft_blocked else "software-unblocked"
+    if target.hard_blocked:
+        current += " and hard-blocked by hardware/platform"
+    safe_name = json.dumps(target.name, ensure_ascii=True)
+    return Elicit(
+        f"Confirm {action} for rfkill device {target.radio_index}, name {safe_name}, type {target.radio_type}? "
+        f"Current state: {current}. State token: {target.confirmation_token}.{effect} "
+        "Only this device's software rfkill state is changed. The hard block cannot be overridden. "
+        "The command uses current OS permissions and does not invoke sudo; network managers or platform policy may affect the resulting radio state.",
+        RadioDeviceActionConfirmation,
+    )
 
 
 async def _confirm_bluetooth_pairing(
@@ -4428,24 +4446,6 @@ async def _confirm_bluetooth_pairing(
         "No discovery scan or controller power change is started. The target address, name, and paired/trusted/connected state are rechecked before the command. "
         "Current BlueZ policy and OS permissions apply; the tool does not invoke sudo. Repeat the exact address, name, and state token.",
         BluetoothPairingConfirmation,
-    )
-    if validation_error or target is None:
-        raise ValueError(validation_error or "The exact rfkill device could not be verified.")
-    effect = (
-        " This turns off the selected radio and may interrupt Wi-Fi, Bluetooth, WWAN, or this MCP connection."
-        if action == "block"
-        else " This enables the software radio state but does not connect to a network; a network manager may react."
-    )
-    current = "soft-blocked" if target.soft_blocked else "software-unblocked"
-    if target.hard_blocked:
-        current += " and hard-blocked by hardware/platform"
-    safe_name = json.dumps(target.name, ensure_ascii=True)
-    return Elicit(
-        f"Confirm {action} for rfkill device {target.radio_index}, name {safe_name}, type {target.radio_type}? "
-        f"Current state: {current}. State token: {target.confirmation_token}.{effect} "
-        "Only this device's software rfkill state is changed. The hard block cannot be overridden. "
-        "The command uses current OS permissions and does not invoke sudo; network managers or platform policy may affect the resulting radio state.",
-        RadioDeviceActionConfirmation,
     )
 
 
