@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import socket
 import sys
 import threading
+import time
 import uuid as uuid_module
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from wayland_mcp.models import (
@@ -36,7 +38,7 @@ PROFILE_KINDS = frozenset({"bridge", "bond", "vlan"})
 BOND_MODES = frozenset({
     "active-backup", "balance-rr", "balance-xor", "broadcast", "802.3ad", "balance-tlb", "balance-alb",
 })
-PROFILE_FIELDS = "UUID,NAME,TYPE,DEVICE,AUTOCONNECT,connection.interface-name"
+PROFILE_FIELDS = "UUID,NAME,TYPE,DEVICE,AUTOCONNECT"
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_PROFILE_ROWS = 5_000
 QUERY_TIMEOUT_SECONDS = 6
@@ -158,17 +160,17 @@ def _split_terse_row(row: str, expected_fields: int = 6) -> list[str] | None:
 
 
 def _parse_profile(row: str) -> ProfileRow | None:
-    fields = _split_terse_row(row)
+    fields = _split_terse_row(row, expected_fields=5)
     if fields is None:
         return None
-    raw_uuid, name, connection_type, device, autoconnect, interface_name = fields
+    raw_uuid, name, connection_type, device, autoconnect = fields
     if not UUID_PATTERN.fullmatch(raw_uuid) or not name or not connection_type:
         return None
     try:
         normalized_uuid = str(uuid_module.UUID(raw_uuid))
     except ValueError:
         return None
-    if len(name) > 256 or len(connection_type) > 64 or len(device) > 64 or len(interface_name) > 64:
+    if len(name) > 256 or len(connection_type) > 64 or len(device) > 64:
         return None
     auto_key = autoconnect.casefold()
     parsed_autoconnect = True if auto_key in {"yes", "true"} else False if auto_key in {"no", "false"} else None
@@ -178,11 +180,47 @@ def _parse_profile(row: str) -> ProfileRow | None:
         connection_type=connection_type,
         device=None if device in {"", "--"} else device,
         autoconnect=parsed_autoconnect,
-        interface_name=None if interface_name in {"", "--"} else interface_name,
+        interface_name=None,
     )
 
 
+def _read_profile_interface_name(
+    binary: str,
+    env: dict[str, str],
+    profile_uuid: str,
+    deadline: float,
+) -> tuple[str | None, str | None]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None, "NetworkManager profile inventory exceeded its time bound while reading interface bindings."
+    wait_seconds = max(1, min(QUERY_TIMEOUT_SECONDS, math.ceil(remaining)))
+    output, error, truncated = run_bounded_command(
+        [
+            binary,
+            "--wait", str(wait_seconds),
+            "--terse", "--escape", "yes", "--get-values", "connection.interface-name",
+            "connection", "show", "uuid", profile_uuid,
+        ],
+        env,
+        command_label="NetworkManager profile interface binding",
+        timeout_seconds=remaining,
+        max_output_bytes=4096,
+    )
+    if error or output is None:
+        return None, "A NetworkManager profile interface binding could not be read."
+    if truncated:
+        return None, "A NetworkManager profile interface binding exceeded its output limit."
+    values = output.splitlines()
+    if len(values) > 1:
+        return None, "NetworkManager returned multiple interface bindings for one profile."
+    interface_name = values[0] if values else ""
+    if len(interface_name) > 64 or any(not character.isprintable() for character in interface_name):
+        return None, "NetworkManager returned a malformed profile interface binding."
+    return (None if interface_name in {"", "--"} else interface_name), None
+
+
 def _read_profiles(binary: str, env: dict[str, str]) -> tuple[tuple[ProfileRow, ...] | None, str | None]:
+    deadline = time.monotonic() + QUERY_TIMEOUT_SECONDS
     output, error, truncated = run_bounded_command(
         [
             binary,
@@ -211,7 +249,10 @@ def _read_profiles(binary: str, env: dict[str, str]) -> tuple[tuple[ProfileRow, 
         if profile.uuid in seen:
             return None, "NetworkManager returned a duplicate profile UUID; no profile was created."
         seen.add(profile.uuid)
-        profiles.append(profile)
+        interface_name, error = _read_profile_interface_name(binary, env, profile.uuid, deadline)
+        if error:
+            return None, error
+        profiles.append(replace(profile, interface_name=interface_name))
     profiles.sort(key=lambda profile: (profile.uuid, profile.name.casefold()))
     return tuple(profiles), None
 

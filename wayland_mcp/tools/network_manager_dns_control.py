@@ -228,6 +228,26 @@ def _get_tool_target(
     profile, error = _profile_snapshot(binary, env, normalized_uuid)
     if error or profile is None:
         return None, error or "The exact saved profile could not be verified."
+    ipv4_dns_selected = any(
+        value is not None
+        for value in (
+            changes.ipv4_dns_servers,
+            changes.ipv4_search_domains,
+            changes.ipv4_ignore_auto_dns,
+        )
+    )
+    ipv6_dns_selected = any(
+        value is not None
+        for value in (
+            changes.ipv6_dns_servers,
+            changes.ipv6_search_domains,
+            changes.ipv6_ignore_auto_dns,
+        )
+    )
+    if ipv4_dns_selected and profile.ipv4.method == "disabled":
+        return None, "IPv4 DNS settings cannot be saved while the profile IPv4 method is disabled; configure the IPv4 method first."
+    if ipv6_dns_selected and profile.ipv6.method == "disabled":
+        return None, "IPv6 DNS settings cannot be saved while the profile IPv6 method is disabled; configure the IPv6 method first."
     expected = _expected_profile(profile, changes)
     if _comparison_snapshot(expected) == _comparison_snapshot(profile):
         return None, "The requested DNS values already match this profile; no change is needed."

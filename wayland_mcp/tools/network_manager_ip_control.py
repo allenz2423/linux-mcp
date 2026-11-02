@@ -166,7 +166,7 @@ def _read_profile_snapshot(
         [
             binary,
             "--wait", str(QUERY_TIMEOUT_SECONDS),
-            "--terse", "--escape", "yes", "--fields", ",".join(fields),
+            "--terse", "--escape", "yes", "--mode", "multiline", "--fields", ",".join(fields),
             "connection", "show", "uuid", normalized_uuid,
         ],
         env,
@@ -179,10 +179,26 @@ def _read_profile_snapshot(
     if truncated:
         return None, "The NetworkManager IP profile response exceeded its output limit."
     rows = [line for line in output.splitlines() if line]
-    parsed = _split_terse_row(rows[0], len(fields)) if len(rows) == 1 else None
-    if parsed is None:
+    values: dict[str, str] = {}
+    malformed = False
+    for row in rows:
+        parsed = _split_terse_row(row, 2)
+        if parsed is None:
+            malformed = True
+            continue
+        key, value = parsed
+        if key not in fields or key in values:
+            malformed = True
+            continue
+        values[key] = value
+    if malformed or set(values) != set(fields):
         return None, "NetworkManager did not return exactly one complete saved profile row."
-    returned_uuid, name, connection_type, method, raw_addresses, raw_gateway = parsed
+    returned_uuid = values["connection.uuid"]
+    name = values["connection.id"]
+    connection_type = values["connection.type"]
+    method = values[f"{family}.method"]
+    raw_addresses = values[f"{family}.addresses"]
+    raw_gateway = values[f"{family}.gateway"]
     try:
         returned_uuid = str(uuid_module.UUID(returned_uuid))
     except ValueError:
